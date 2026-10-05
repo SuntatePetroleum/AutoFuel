@@ -1,5 +1,5 @@
-name = "fuel-scheduler"
-main = "src/index.js"
+name = "autofuel"
+main = "index.js"
 compatibility_date = "2025-09-01"
 
 # Create a D1 database in the Cloudflare dashboard (Storage & databases > D1),
