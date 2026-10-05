@@ -93,6 +93,16 @@
   .comps { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .comp { font-size: 12px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 6px; font-variant-numeric: tabular-nums; }
   .comp b { color: var(--faint); font-weight: 600; margin-right: 4px; }
+  .level { height: 6px; border-radius: 999px; background: var(--surface-2); overflow: hidden; margin-top: 8px; max-width: 360px; }
+  .level span { display: block; height: 100%; background: var(--accent); border-radius: 999px; }
+  .level.over span { background: var(--warn); }
+  .group-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--surface-2); border-radius: var(--radius) var(--radius) 0 0; }
+  .group-head a { font-weight: 650; color: var(--text); text-decoration: none; }
+  .group-head a:hover { text-decoration: underline; }
+  .dip-hist { list-style: none; margin: 0; padding: 0; }
+  .dip-hist li { display: flex; gap: 10px; align-items: center; padding: 10px 0; border-top: 1px solid var(--border); }
+  .dip-hist li:first-child { border-top: 0; }
+  .dip-hist .main { flex: 1; min-width: 0; }
 
   .details { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px 20px; }
   .details dt { font-size: 12px; color: var(--muted); }
@@ -179,6 +189,26 @@ const fmtN = (n) => (n == null || n === '' ? '' : Number(n).toLocaleString('en-A
 const fmtL = (n) => (n == null ? '' : fmtN(Math.round(n)) + ' L');
 const fmtML = (n) => (n >= 1e6 ? (n / 1e6).toLocaleString('en-AU', { maximumFractionDigits: 2 }) + ' ML' : fmtL(n));
 const plural = (n, one, many) => `${fmtN(n)} ${n === 1 ? one : many || one + 's'}`;
+const pct = (litres, cap) => (cap ? Math.round((litres / cap) * 100) : 0);
+const zone = () => (state.settings && state.settings.timezone) || 'Australia/Brisbane';
+function fmtWhen(ms) {
+  return new Intl.DateTimeFormat('en-AU', { timeZone: zone(), weekday: 'short', day: 'numeric', month: 'short', hour: 'numeric', minute: '2-digit' }).format(new Date(ms));
+}
+function ago(ms) {
+  const mins = Math.round((Date.now() - ms) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 48) return `${hours} h ago`;
+  return `${Math.round(hours / 24)} days ago`;
+}
+// The current time in the company's time zone, as a datetime-local value.
+function nowLocal() {
+  const p = Object.fromEntries(new Intl.DateTimeFormat('en-CA', { timeZone: zone(), hourCycle: 'h23', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+    .formatToParts(new Date()).map((x) => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`;
+}
+const canDip = () => state.me && (state.me.role === 'admin' || state.me.role === 'dispatcher');
 const icon = {
   chev: '<svg class="chev" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg>',
   logo: '<svg width="30" height="30" viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="8" fill="var(--accent)"/><path d="M16 7c3.6 4.6 6 8.1 6 11.1A6 6 0 0 1 10 18.1C10 15.1 12.4 11.6 16 7Z" fill="var(--accent-ink)"/></svg>',
@@ -348,9 +378,9 @@ function readFields(form, fields) {
   return out;
 }
 
-function openDialog({ title, sub, body, onSave, onDelete, saveLabel = 'Save', deleteLabel = 'Delete', readOnly }) {
+function openDialog({ title, sub, body, onSave, onDelete, saveLabel = 'Save', deleteLabel = 'Delete', readOnly, anyRole }) {
   const dlg = $('#dlg');
-  const canEdit = isAdmin() && !readOnly;
+  const canEdit = (isAdmin() || (anyRole && canDip())) && !readOnly;
   dlg.innerHTML = `
     <form method="dialog" novalidate>
       <div class="dlg-head"><h2>${esc(title)}</h2>${sub ? `<div class="muted" style="font-size:13px">${esc(sub)}</div>` : ''}</div>
@@ -469,7 +499,7 @@ function wireCompartments() {
 
 /* -------------------------------------------------------------- views */
 const NAV = [
-  ['sites', 'Sites'], ['tanks', 'Tanks'], ['trucks', 'Trucks'], ['grades', 'Grades'],
+  ['sites', 'Sites'], ['dips', 'Dips'], ['tanks', 'Tanks'], ['trucks', 'Trucks'], ['grades', 'Grades'],
   ['terminals', 'Terminals'], ['drivers', 'Drivers'], ['settings', 'Settings'], ['import', 'Import'], ['users', 'Users', true],
 ];
 
@@ -496,7 +526,7 @@ function shell(route, content) {
 }
 
 function headHtml(title, sub, actions = '') {
-  return `<div class="head"><div><h1>${esc(title)}</h1>${sub ? `<div class="sub">${sub}</div>` : ''}</div><span class="spacer"></span>${actions}</div>`;
+  return `<div class="head"><div><h1>${esc(title)}</h1>${sub ? `<div class="sub">${sub}</div>` : ''}</div><span class="spacer"></span>${actions ? `<div style="display:flex;gap:8px;flex-wrap:wrap">${actions}</div>` : ''}</div>`;
 }
 const addBtn = (name, label) => (isAdmin() ? `<button class="btn primary" data-add="${name}">${esc(label)}</button>` : '');
 const emptyHtml = (title, text) => `<div class="empty"><strong>${esc(title)}</strong>${text}</div>`;
@@ -522,7 +552,8 @@ async function viewSites() {
 }
 
 async function viewSite(id) {
-  const [sites, tanks, settings] = await Promise.all([load('sites'), load('tanks'), loadSettings()]);
+  const [sites, tanks, settings, latest] = await Promise.all([load('sites'), load('tanks'), loadSettings(), api('/dips/latest')]);
+  const dipOf = new Map(latest.map((d) => [d.tank_id, d]));
   const s = sites.find((x) => x.id === id);
   if (!s) return `<a class="back" href="#/sites">← Sites</a>${emptyHtml('Site not found', 'It may have been deleted.')}`;
   const mine = tanks.filter((t) => t.site_id === id);
@@ -533,7 +564,8 @@ async function viewSite(id) {
   const tankRows = mine.map((t) => `
     <li><button class="row" data-edit-tank="${t.id}">
       <div class="main"><div class="title">${esc(t.name)} ${t.active ? '' : '<span class="badge off">Inactive</span>'}</div>
-        <div class="meta"><span class="chip">${esc(t.grade_code)}</span> ${t.tank_number ? '· Tank ' + esc(t.tank_number) : ''}</div></div>
+        <div class="meta"><span class="chip">${esc(t.grade_code)}</span> ${t.tank_number ? '· Tank ' + esc(t.tank_number) : ''} ${dipLine(t, dipOf.get(t.id))}</div>
+        ${dipOf.get(t.id) ? levelBar(dipOf.get(t.id).litres, t.capacity_l) : ''}</div>
       <div class="side"><strong class="num">${fmtL(t.capacity_l)}</strong><br>fills to ${fmtL(t.capacity_l * fill)}</div>${icon.chev}</button></li>`).join('');
   return `<a class="back" href="#/sites">← Sites</a>` +
     headHtml(s.name, esc(s.trading_name || ''), isAdmin() ? `<button class="btn" data-edit-site="${s.id}">Edit site</button>` : '') +
@@ -542,7 +574,9 @@ async function viewSite(id) {
       ${d('Deliveries', deliveryText(s))}${d('Largest combination', esc(s.max_combination || 'Any'))}${d('Average drop time', s.drop_minutes != null ? s.drop_minutes + ' min' : '')}
       ${d('Site contact', esc([s.contact_name, s.contact_phone].filter(Boolean).join(' · ')))}${d('Sales code', esc(s.sales_code))}${d('Price board site ID', esc(s.external_id))}
     </dl></div>
-    <div class="section">${headHtml('Tanks', mine.length ? `${plural(mine.length, 'tank')} · ${fmtL(mine.reduce((a, t) => a + t.capacity_l, 0))}` : '', addBtn('tanks', 'Add tank').replace('data-add="tanks"', `data-add="tanks" data-site="${s.id}"`))}
+    <div class="section">${headHtml('Tanks', mine.length ? `${plural(mine.length, 'tank')} · ${fmtL(mine.reduce((a, t) => a + t.capacity_l, 0))}` : '',
+      (mine.some((t) => t.active) && canDip() ? `<button class="btn" data-dip-enter="${s.id}">Enter dips</button>` : '') +
+      addBtn('tanks', 'Add tank').replace('data-add="tanks"', `data-add="tanks" data-site="${s.id}"`))}
       <div class="card">${mine.length ? `<ul class="rows">${tankRows}</ul>` : emptyHtml('No tanks at this site', isAdmin() ? 'Add the tanks here, with their grade and capacity.' : '')}</div></div>`;
 }
 
@@ -633,6 +667,9 @@ const SETTINGS = [
     { k: 'lookback_weeks', label: 'Forecast lookback', suffix: 'weeks', step: 1, hint: 'How much sales history each forecast averages.' },
     { k: 'holiday_region', label: 'Public holiday calendar', type: 'select', options: ['QLD', 'NSW', 'VIC', 'SA', 'WA', 'TAS', 'NT', 'ACT', 'None'] },
     { k: 'timezone', label: 'Time zone', type: 'text', hint: 'Like Australia/Brisbane' },
+  ]],
+  ['Dips', [
+    { k: 'dip_stale_hours', label: 'A dip is out of date after', suffix: 'hours', step: 'any', hint: 'Tanks with older dips are flagged on the Dips screen.' },
   ]],
 ];
 
@@ -924,6 +961,295 @@ function wireImport() {
   drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); handle(e.dataTransfer.files[0]); });
 }
 
+/* --------------------------------------------------------------- dips */
+function levelBar(litres, cap) {
+  const p = pct(litres, cap);
+  return `<div class="level${p > 100 ? ' over' : ''}" aria-hidden="true"><span style="width:${Math.min(100, Math.max(0, p))}%"></span></div>`;
+}
+
+function dipState(dip) {
+  if (!dip) return 'never';
+  return Date.now() - dip.taken_at > state.settings.dip_stale_hours * 3600000 ? 'stale' : 'fresh';
+}
+
+function dipLine(tank, dip) {
+  if (!tank.active) return '';
+  if (!dip) return '<span class="badge warn">No dip yet</span>';
+  const stale = dipState(dip) === 'stale';
+  return `· ${fmtL(dip.litres)} (${pct(dip.litres, tank.capacity_l)}%) ${ago(dip.taken_at)} ${stale ? '<span class="badge warn">Out of date</span>' : ''}`;
+}
+
+async function viewDips() {
+  const [sites, tanks, latest, settings] = await Promise.all([load('sites'), load('tanks'), api('/dips/latest'), loadSettings()]);
+  const dipOf = new Map(latest.map((d) => [d.tank_id, d]));
+  const active = tanks.filter((t) => t.active);
+  const counts = { fresh: 0, stale: 0, never: 0 };
+  for (const t of active) counts[dipState(dipOf.get(t.id))]++;
+  const flash = state.flash;
+  state.flash = null;
+
+  const groups = sites.map((s) => {
+    const mine = active.filter((t) => t.site_id === s.id);
+    if (!mine.length) return '';
+    const states = mine.map((t) => dipState(dipOf.get(t.id)));
+    const needs = states.some((x) => x !== 'fresh');
+    const rows = mine.map((t) => {
+      const d = dipOf.get(t.id);
+      const st = dipState(d);
+      return `<li><button class="row" data-dip-tank="${t.id}">
+        <div class="main"><div class="title">${esc(t.name)} <span class="chip">${esc(t.grade_code)}</span></div>
+          ${d ? levelBar(d.litres, t.capacity_l) : ''}</div>
+        <div class="side">${d
+          ? `<strong class="num">${fmtL(d.litres)}</strong> · ${pct(d.litres, t.capacity_l)}%<br>${esc(fmtWhen(d.taken_at))} · ${ago(d.taken_at)}${st === 'stale' ? '<br><span class="badge warn">Out of date</span>' : ''}`
+          : '<span class="badge warn">No dip yet</span>'}</div>${icon.chev}</button></li>`;
+    }).join('');
+    return `<div class="card" data-group="${esc(s.name.toLowerCase())}" data-needs="${needs ? 1 : 0}">
+      <div class="group-head"><a href="#/sites/${s.id}">${esc(s.name)}</a><span class="spacer"></span>
+        ${canDip() ? `<button class="btn sm" data-dip-enter="${s.id}">Enter dips</button>` : ''}</div>
+      <ul class="rows">${rows}</ul></div>`;
+  }).join('');
+
+  const inactive = tanks.length - active.length;
+  return headHtml('Tank dips', `Latest reading for each active tank, in litres. A dip older than ${fmtN(settings.dip_stale_hours)} hours is flagged.${inactive ? ` ${plural(inactive, 'inactive tank')} not shown.` : ''}`,
+    canDip() ? '<button class="btn" data-dip-upload>Upload</button><button class="btn primary" data-dip-enter="">Enter dips</button>' : '') +
+    (flash ? `<div class="note ${flash.kind}" style="margin-bottom:12px">${flash.html}</div>` : '') +
+    (active.length ? `<div class="stats"><span><strong>${fmtN(counts.fresh)}</strong> up to date</span><span><strong>${fmtN(counts.stale)}</strong> out of date</span><span><strong>${fmtN(counts.never)}</strong> never dipped</span></div>
+      <div class="toolbar"><input type="text" id="dq" placeholder="Search sites" aria-label="Search sites">
+        <select id="dneeds" aria-label="Which sites"><option value="">All sites</option><option value="1">Sites needing a dip</option></select></div>
+      <div id="dip-groups" style="display:grid;gap:16px">${groups}</div>`
+      : `<div class="card">${emptyHtml('No active tanks', 'Add tanks to your sites first.')}</div>`);
+}
+
+async function enterDipsDialog(siteId) {
+  const [sites, tanks, latest] = await Promise.all([load('sites'), load('tanks'), api('/dips/latest')]);
+  const dipOf = new Map(latest.map((d) => [d.tank_id, d]));
+  const withTanks = sites.filter((s) => tanks.some((t) => t.site_id === s.id && t.active));
+  if (!withTanks.length) throw new Error('There are no active tanks to dip yet.');
+  let current = withTanks.find((s) => s.id === siteId) ? siteId : withTanks[0].id;
+  const inputs = (sid) => tanks.filter((t) => t.site_id === sid && t.active).map((t) => {
+    const d = dipOf.get(t.id);
+    return `<div class="field"><label for="dip_${t.id}">${esc(t.name)} <span class="chip">${esc(t.grade_code)}</span></label>
+      <div class="suffix"><input type="text" inputmode="numeric" id="dip_${t.id}" data-tank="${t.id}" autocomplete="off" placeholder="Litres"><span>L</span></div>
+      <div class="hint">Capacity ${fmtL(t.capacity_l)}${d ? ` · last ${fmtL(d.litres)}, ${ago(d.taken_at)}` : ' · no dip yet'}</div></div>`;
+  }).join('');
+  openDialog({
+    title: 'Enter dips',
+    sub: 'Litres in each tank. Leave a tank blank to skip it.',
+    anyRole: true,
+    body: `<div class="grid">
+      <div class="field"><label for="dip_site">Site</label><select id="dip_site">${withTanks.map((s) => `<option value="${s.id}"${s.id === current ? ' selected' : ''}>${esc(s.name)}</option>`).join('')}</select></div>
+      <div class="field"><label for="dip_time">Taken at</label><input type="datetime-local" id="dip_time" value="${nowLocal()}" max="${nowLocal()}"></div>
+    </div><div class="grid" id="dip_inputs" style="margin-top:14px">${inputs(current)}</div>`,
+    saveLabel: 'Save dips',
+    onSave: async () => {
+      const readings = $$('#dip_inputs input').filter((i) => i.value.trim() !== '').map((i) => ({ tank_id: Number(i.dataset.tank), litres: i.value.trim() }));
+      if (!readings.length) throw new Error('Enter litres for at least one tank.');
+      const when = $('#dip_time').value;
+      if (!when) throw new Error('Enter when the dips were taken.');
+      const res = await api('/dips', { method: 'POST', body: { taken_at: when, readings } });
+      const site = withTanks.find((s) => s.id === current);
+      state.flash = res.warnings.length
+        ? { kind: 'warn', html: `Saved ${plural(res.saved, 'dip')} for ${esc(site.name)}, but check these:<ul>${res.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>` }
+        : null;
+      toast(`Saved ${plural(res.saved, 'dip')} for ${site.name}`);
+      render();
+    },
+  });
+  $('#dip_site').onchange = (e) => {
+    current = Number(e.target.value);
+    $('#dip_inputs').innerHTML = inputs(current);
+  };
+}
+
+async function dipHistoryDialog(tankId) {
+  const tanks = await load('tanks');
+  const t = tanks.find((x) => x.id === tankId);
+  if (!t) return;
+  const rows = await api('/dips?tank=' + tankId);
+  const who = (d) => [d.entered_by_name, d.source === 'upload' ? 'uploaded' : d.source === 'driver' ? 'driver' : null].filter(Boolean).join(', ');
+  openDialog({
+    title: `${t.site_name} · ${t.name}`,
+    sub: `${t.grade_code} · capacity ${fmtL(t.capacity_l)}`,
+    readOnly: true,
+    body: rows.length
+      ? `<ul class="dip-hist">${rows.map((d) => `<li><div class="main"><strong class="num">${fmtL(d.litres)}</strong> <span class="muted">(${pct(d.litres, t.capacity_l)}%)</span>
+          <div class="muted" style="font-size:13px">${esc(fmtWhen(d.taken_at))} · ${ago(d.taken_at)}${who(d) ? ' · ' + esc(who(d)) : ''}</div></div>
+          ${canDip() ? `<button type="button" class="btn sm ghost danger" data-dip-del="${d.id}">Delete</button>` : ''}</li>`).join('')}</ul>
+          ${rows.length === 60 ? '<div class="hint" style="margin-top:8px">Showing the latest 60 dips.</div>' : ''}`
+      : emptyHtml('No dips yet', 'Enter one from the Dips screen.'),
+  });
+  $$('#dlg [data-dip-del]').forEach((b) => {
+    b.onclick = async () => {
+      if (b.dataset.confirm !== '1') {
+        b.dataset.confirm = '1';
+        b.textContent = 'Tap again';
+        return;
+      }
+      try {
+        await api('/dips/' + b.dataset.dipDel, { method: 'DELETE' });
+        toast('Dip deleted');
+        $('#dlg').close();
+        await dipHistoryDialog(tankId);
+        render();
+      } catch (err) {
+        $('#dlg-err').textContent = err.message;
+      }
+    };
+  });
+}
+
+// ---- dip uploads: a CSV template of every active tank, filled in and uploaded as CSV or .xlsx
+function csvCell(v) {
+  const s = String(v == null ? '' : v);
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+async function downloadDipTemplate() {
+  const tanks = (await load('tanks')).filter((t) => t.active);
+  const lines = [['Site', 'Tank', 'Grade', 'Capacity (L)', 'Litres', 'Taken at (dd/mm/yyyy hh:mm)']];
+  for (const t of tanks) lines.push([t.site_name, t.name, t.grade_code, t.capacity_l, '', '']);
+  const csv = '﻿' + lines.map((l) => l.map(csvCell).join(',')).join('\r\n') + '\r\n';
+  const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `dips-${nowLocal().slice(0, 10)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let cell = '';
+  let quoted = false;
+  text = text.replace(/^﻿/, '');
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quoted) {
+      if (c === '"' && text[i + 1] === '"') { cell += '"'; i++; }
+      else if (c === '"') quoted = false;
+      else cell += c;
+    } else if (c === '"') quoted = true;
+    else if (c === ',') { row.push(cell); cell = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(cell); rows.push(row); row = []; cell = '';
+    } else cell += c;
+  }
+  if (cell !== '' || row.length) { row.push(cell); rows.push(row); }
+  return rows;
+}
+
+// Excel stores date-times as days since 30 Dec 1899, in wall-clock time.
+function excelSerialToLocal(n) {
+  const d = new Date(Math.round((n - 25569) * 86400) * 1000);
+  const two = (x) => String(x).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${two(d.getUTCMonth() + 1)}-${two(d.getUTCDate())}T${two(d.getUTCHours())}:${two(d.getUTCMinutes())}`;
+}
+
+// Australian dates: 5/10/2026 6:30, 05/10/2026 18:30, 5/10/26 6:30 pm.
+function auDateToLocal(v) {
+  const s = String(v).trim();
+  const m = s.match(/^(\d{1,2})[/.-](\d{1,2})[/.-](\d{2,4})[ T,]+(\d{1,2}):(\d{2})(?::\d{2})?\s*(am|pm)?$/i);
+  if (!m) return s;
+  let [, d, mo, y, h, mi, ap] = m;
+  y = y.length === 2 ? '20' + y : y;
+  h = Number(h);
+  if (ap) h = (h % 12) + (ap.toLowerCase() === 'pm' ? 12 : 0);
+  const two = (x) => String(x).padStart(2, '0');
+  return `${y}-${two(mo)}-${two(d)}T${two(h)}:${mi}`;
+}
+
+const DIP_COLS = {
+  'site': 'site', 'site name': 'site', 'tank': 'tank', 'tank name': 'tank', 'grade': 'grade',
+  'litres': 'litres', 'litres l': 'litres', 'dip': 'litres', 'dip l': 'litres', 'level': 'litres', 'volume': 'litres',
+  'taken at': 'taken_at', 'date': 'taken_at', 'date time': 'taken_at', 'date/time': 'taken_at', 'time': 'taken_at', 'dip time': 'taken_at',
+};
+
+function dipRowsFromTable(table) {
+  const header = (table[0] || []).map((h) => String(h == null ? '' : h).toLowerCase().replace(/\(.*?\)/g, '').replace(/\s+/g, ' ').trim());
+  const map = header.map((h) => DIP_COLS[h] || null);
+  if (!map.includes('site') || !map.includes('litres')) throw new Error('The file needs at least a Site column and a Litres column. Start from the template.');
+  const rows = [];
+  let skipped = 0;
+  for (let i = 1; i < table.length; i++) {
+    const r = table[i];
+    if (!r || r.every((v) => v == null || String(v).trim() === '')) continue;
+    const o = { _row: i + 1 };
+    map.forEach((f, c) => {
+      if (!f) return;
+      let v = r[c];
+      if (v == null) return;
+      if (f === 'taken_at') v = typeof v === 'number' ? excelSerialToLocal(v) : auDateToLocal(v);
+      else if (typeof v === 'string') v = v.trim();
+      if (v !== '') o[f] = v;
+    });
+    if (o.litres == null) { skipped++; continue; }
+    rows.push(o);
+  }
+  return { rows, skipped };
+}
+
+function uploadDipsDialog() {
+  let parsed = null;
+  openDialog({
+    title: 'Upload dips',
+    sub: 'For entering many tanks at once.',
+    anyRole: true,
+    saveLabel: 'Upload dips',
+    body: `<ol style="margin:0 0 14px;padding-left:20px;display:grid;gap:6px">
+        <li><button type="button" class="btn sm" data-dip-template>Download the template</button> It lists every active tank.</li>
+        <li>Fill in <strong>Litres</strong>. Fill in <strong>Taken at</strong> too, unless the dips were taken just now. Rows left blank are skipped.</li>
+        <li>Choose the file below. CSV or Excel (.xlsx) both work.</li></ol>
+      <div class="field"><label for="dip_file">File</label><input type="file" id="dip_file" accept=".csv,.xlsx,text/csv"></div>
+      <div id="dip_preview" style="margin-top:12px"></div>`,
+    onSave: async () => {
+      if (!parsed) throw new Error('Choose a file first.');
+      try {
+        const res = await api('/dips/import', { method: 'POST', body: { rows: parsed.rows } });
+        state.flash = {
+          kind: res.warnings.length ? 'warn' : 'good',
+          html: `Uploaded ${plural(res.saved, 'dip')} for ${plural(res.tanks, 'tank')}.${res.warnings.length ? ` Check these:<ul>${res.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}`,
+        };
+        toast('Dips uploaded');
+        location.hash = '#/dips';
+        render();
+      } catch (err) {
+        const list = err.data && err.data.errors;
+        if (!list) throw err;
+        $('#dip_preview').innerHTML = `<div class="note bad">Nothing was uploaded. Fix these and try again:<ul>${list.slice(0, 20).map((x) => `<li>${esc(x)}</li>`).join('')}</ul>${list.length > 20 ? `…and ${list.length - 20} more.` : ''}</div>`;
+        throw new Error('');
+      }
+    },
+  });
+  $('#dip_file').onchange = async (e) => {
+    const file = e.target.files[0];
+    const out = $('#dip_preview');
+    parsed = null;
+    $('#dlg-err').textContent = '';
+    if (!file) { out.innerHTML = ''; return; }
+    try {
+      let table;
+      if (/\.xlsx$/i.test(file.name)) {
+        const sheets = await readXlsx(await file.arrayBuffer());
+        table = sheets.Dips || Object.values(sheets)[0];
+      } else if (/\.csv$/i.test(file.name) || file.type === 'text/csv') {
+        table = parseCsv(await file.text());
+      } else throw new Error('Choose a .csv or .xlsx file.');
+      parsed = dipRowsFromTable(table || []);
+      if (!parsed.rows.length) throw new Error('No rows have litres filled in.');
+      const siteCount = new Set(parsed.rows.map((r) => String(r.site).toLowerCase())).size;
+      out.innerHTML = `<div class="note good">${plural(parsed.rows.length, 'dip')} across ${plural(siteCount, 'site')} ready to upload.${parsed.skipped ? ` ${plural(parsed.skipped, 'row')} with no litres will be skipped.` : ''}</div>`;
+    } catch (err) {
+      parsed = null;
+      out.innerHTML = `<div class="note bad">${esc(err.message)}</div>`;
+    }
+  };
+  $('#dlg [data-dip-template]').onclick = () => downloadDipTemplate().catch((err) => toast(err.message));
+}
+
 /* ----------------------------------------------------- auth screens */
 function authScreen(setup) {
   return `<div class="auth"><div class="card">${icon.logo}
@@ -976,7 +1302,7 @@ async function render() {
   }
   const parts = (location.hash.replace(/^#\/?/, '') || 'sites').split('/');
   const route = parts[0];
-  const views = { sites: viewSites, tanks: viewTanks, trucks: viewTrucks, grades: viewGrades, terminals: viewTerminals, drivers: viewDrivers, settings: viewSettings, import: viewImport, users: viewUsers };
+  const views = { sites: viewSites, dips: viewDips, tanks: viewTanks, trucks: viewTrucks, grades: viewGrades, terminals: viewTerminals, drivers: viewDrivers, settings: viewSettings, import: viewImport, users: viewUsers };
   const view = route === 'sites' && parts[1] ? () => viewSite(Number(parts[1])) : views[route] || viewSites;
   if (!$('#main')) app.innerHTML = shell(route, '');
   else $$('nav.tabs a').forEach((a) => a.classList.toggle('on', a.getAttribute('href') === '#/' + route));
@@ -1035,10 +1361,21 @@ function afterRender(route) {
     };
   }
   if (route === 'import') wireImport();
+  if (route === 'dips' && $('#dq')) {
+    const apply = () => {
+      const term = $('#dq').value.trim().toLowerCase();
+      const needs = $('#dneeds').value;
+      $$('#dip-groups [data-group]').forEach((g) => {
+        g.hidden = Boolean((term && !g.dataset.group.includes(term)) || (needs === '1' && g.dataset.needs !== '1'));
+      });
+    };
+    $('#dq').oninput = apply;
+    $('#dneeds').onchange = apply;
+  }
 }
 
 document.addEventListener('click', async (e) => {
-  const t = e.target.closest('[data-add],[data-edit],[data-edit-tank],[data-edit-site],[data-user],[data-add-user],[data-act],#menu-btn');
+  const t = e.target.closest('[data-add],[data-edit],[data-edit-tank],[data-edit-site],[data-user],[data-add-user],[data-act],[data-dip-enter],[data-dip-upload],[data-dip-tank],#menu-btn');
   const menu = $('#menu');
   if (menu && !e.target.closest('#menu')) { menu.classList.remove('open'); $('#menu-btn').setAttribute('aria-expanded', 'false'); }
   if (!t) return;
@@ -1067,6 +1404,12 @@ document.addEventListener('click', async (e) => {
     } else if (t.dataset.editSite) {
       const rows = await load('sites');
       await editEntity('sites', rows.find((r) => r.id === Number(t.dataset.editSite)));
+    } else if (t.dataset.dipEnter !== undefined) {
+      await enterDipsDialog(Number(t.dataset.dipEnter));
+    } else if (t.dataset.dipUpload !== undefined) {
+      uploadDipsDialog();
+    } else if (t.dataset.dipTank) {
+      await dipHistoryDialog(Number(t.dataset.dipTank));
     } else if (t.dataset.addUser !== undefined) {
       editUser(null);
     } else if (t.dataset.user) {
