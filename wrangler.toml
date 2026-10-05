@@ -7,7 +7,7 @@ compatibility_date = "2025-09-01"
 [[d1_databases]]
 binding = "DB"
 database_name = "fuel-scheduler"
-database_id = "PASTE-YOUR-D1-DATABASE-ID-HERE"
+database_id = "19b7c211-65f5-4dc1-8cde-c61c78e8458e"
 
 # Lets src/index.js import the app's single HTML page as text.
 [[rules]]
