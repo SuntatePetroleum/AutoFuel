@@ -1,0 +1,13 @@
+{
+  "name": "fuel-scheduler",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Fuel delivery scheduler: run-out forecasting and tanker load planning",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.0.0"
+  }
+}
