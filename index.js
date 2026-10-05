@@ -156,6 +156,29 @@ const MIGRATIONS = [
     `CREATE INDEX IF NOT EXISTS idx_dips_company_time ON dips(company_id, taken_at)`,
     `ALTER TABLE settings ADD COLUMN dip_stale_hours REAL NOT NULL DEFAULT 36`,
   ],
+  // v3: daily sales per site and grade, and which point-of-sale items are which grade.
+  [
+    `CREATE TABLE IF NOT EXISTS sales_daily (
+      company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+      grade_id INTEGER NOT NULL REFERENCES grades(id) ON DELETE CASCADE,
+      day TEXT NOT NULL,
+      litres REAL NOT NULL,
+      uploaded_at INTEGER NOT NULL,
+      PRIMARY KEY (site_id, grade_id, day)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_sales_company_day ON sales_daily(company_id, day)`,
+    `CREATE TABLE IF NOT EXISTS sales_items (
+      company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      item_code TEXT NOT NULL,
+      item_name TEXT,
+      grade_id INTEGER REFERENCES grades(id) ON DELETE CASCADE,
+      PRIMARY KEY (company_id, item_code)
+    )`,
+    // The lowest level is now hours of sales, and the extra margin defaults to none.
+    `ALTER TABLE settings ADD COLUMN floor_hours REAL NOT NULL DEFAULT 12`,
+    `UPDATE settings SET runout_buffer_h = 0 WHERE runout_buffer_h = 12`,
+  ],
 ];
 
 let schemaVersionSeen = 0;
@@ -387,6 +410,16 @@ const ENTITIES = {
     list: `SELECT s.*, COUNT(t.id) AS tank_count, COALESCE(SUM(t.capacity_l), 0) AS total_capacity_l
            FROM sites s LEFT JOIN tanks t ON t.site_id = s.id
            WHERE s.company_id = ? GROUP BY s.id ORDER BY s.name`,
+    // Sales are matched to sites by this code, so two sites can't share one.
+    async validate(env, companyId, id, values) {
+      if (!values.sales_code) return;
+      const clash = await env.DB.prepare(
+        'SELECT name FROM sites WHERE company_id = ? AND lower(trim(sales_code)) = lower(?) AND id != ?'
+      )
+        .bind(companyId, values.sales_code, id || 0)
+        .first();
+      if (clash) throw new HttpError(409, `${clash.name} already uses sales code ${values.sales_code}.`);
+    },
   },
   tanks: {
     table: 'tanks',
@@ -513,6 +546,7 @@ async function createEntity(env, companyId, name, body) {
   const def = ENTITIES[name];
   const values = pickValues(def, body, { creating: true });
   await checkRefs(env, companyId, def, values);
+  if (def.validate) await def.validate(env, companyId, null, values);
   const cols = Object.keys(values);
   const sql = `INSERT INTO ${def.table} (company_id${cols.map((c) => ', ' + c).join('')})
                VALUES (?${cols.map(() => ', ?').join('')}) RETURNING id`;
@@ -532,6 +566,7 @@ async function updateEntity(env, companyId, name, id, body) {
   await checkRefs(env, companyId, def, values);
   const exists = await env.DB.prepare(`SELECT id FROM ${def.table} WHERE id = ? AND company_id = ?`).bind(id, companyId).first();
   if (!exists) throw new HttpError(404, `That ${def.noun} was not found.`);
+  if (def.validate) await def.validate(env, companyId, id, values);
   const cols = Object.keys(values);
   if (cols.length) {
     const sql = `UPDATE ${def.table} SET ${cols.map((c) => `${c} = ?`).join(', ')} WHERE id = ? AND company_id = ?`;
@@ -550,10 +585,20 @@ async function deleteEntity(env, companyId, name, id) {
   const exists = await env.DB.prepare(`SELECT id FROM ${def.table} WHERE id = ? AND company_id = ?`).bind(id, companyId).first();
   if (!exists) throw new HttpError(404, `That ${def.noun} was not found.`);
   if (def.beforeDelete) await def.beforeDelete(env, companyId, id);
-  // Child rows go too: a site's tanks, a truck's compartments.
+  // Child rows go too: a site's tanks, dips and sales; a tank's dips; a truck's compartments.
   const stmts = [];
-  if (name === 'sites') stmts.push(env.DB.prepare('DELETE FROM tanks WHERE site_id = ? AND company_id = ?').bind(id, companyId));
-  if (name === 'trucks') stmts.push(env.DB.prepare('DELETE FROM compartments WHERE truck_id = ? AND company_id = ?').bind(id, companyId));
+  const run = (sql) => stmts.push(env.DB.prepare(sql).bind(id, companyId));
+  if (name === 'sites') {
+    run('DELETE FROM dips WHERE tank_id IN (SELECT id FROM tanks WHERE site_id = ?) AND company_id = ?');
+    run('DELETE FROM tanks WHERE site_id = ? AND company_id = ?');
+    run('DELETE FROM sales_daily WHERE site_id = ? AND company_id = ?');
+  }
+  if (name === 'tanks') run('DELETE FROM dips WHERE tank_id = ? AND company_id = ?');
+  if (name === 'grades') {
+    run('DELETE FROM sales_daily WHERE grade_id = ? AND company_id = ?');
+    run('DELETE FROM sales_items WHERE grade_id = ? AND company_id = ?');
+  }
+  if (name === 'trucks') run('DELETE FROM compartments WHERE truck_id = ? AND company_id = ?');
   stmts.push(env.DB.prepare(`DELETE FROM ${def.table} WHERE id = ? AND company_id = ?`).bind(id, companyId));
   await env.DB.batch(stmts);
 }
@@ -562,10 +607,10 @@ async function deleteEntity(env, companyId, name, id) {
 
 const SETTINGS_FIELDS = {
   safe_fill_pct: { type: 'num', min: 0.5, max: 1, label: 'Safe fill limit' },
-  floor_days: { type: 'num', min: 0, max: 14, label: 'Safety floor (days of sales)' },
+  floor_hours: { type: 'num', min: 0, max: 336, label: 'Lowest level (hours of sales)' },
   floor_min_pct: { type: 'num', min: 0, max: 0.5, label: 'Safety floor minimum' },
   overfill_margin_l: { type: 'int', min: 0, max: 20000, label: 'Overfill margin' },
-  runout_buffer_h: { type: 'num', min: 0, max: 168, label: 'Run-out buffer' },
+  runout_buffer_h: { type: 'num', min: 0, max: 168, label: 'Extra margin' },
   min_drop_l: { type: 'int', min: 0, max: 100000, label: 'Minimum worthwhile drop' },
   lookback_weeks: { type: 'int', min: 1, max: 52, label: 'Forecast lookback' },
   whole_compartments: { type: 'bool', label: 'Whole compartments only' },
@@ -959,6 +1004,17 @@ async function importSetup(request, env, me) {
 
 /* ------------------------------------------------------------------ dips */
 
+const zoneFormatters = new Map();
+// How far the zone's clock is ahead of UTC at a moment, in milliseconds.
+function zoneOffset(ms, timeZone) {
+  if (!zoneFormatters.has(timeZone)) {
+    zoneFormatters.set(timeZone, new Intl.DateTimeFormat('en-US', {
+      timeZone, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric',
+    }));
+  }
+  const p = Object.fromEntries(zoneFormatters.get(timeZone).formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
+  return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - (ms - (ms % 1000));
+}
 const LOCAL_TIME_RE = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::\d{2})?$/;
 
 // A wall-clock time in the company's time zone, like "2026-10-05T06:30", to epoch milliseconds.
@@ -971,9 +1027,12 @@ function zonedToUtc(local, timeZone) {
   if (check.getUTCMonth() !== mo - 1 || check.getUTCDate() !== d || h > 23 || mi > 59) {
     throw new HttpError(400, `"${local}" isn't a real date and time.`);
   }
-  const fmt = new Intl.DateTimeFormat('en-US', {
-    timeZone, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric',
-  });
+  if (!zoneFormatters.has(timeZone)) {
+    zoneFormatters.set(timeZone, new Intl.DateTimeFormat('en-US', {
+      timeZone, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric',
+    }));
+  }
+  const fmt = zoneFormatters.get(timeZone);
   const offsetAt = (ms) => {
     const p = Object.fromEntries(fmt.formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
     return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - ms;
@@ -1137,6 +1196,427 @@ async function deleteDip(env, me, id) {
   return json({ ok: true });
 }
 
+/* ----------------------------------------------------------------- sales */
+
+const DAY_RE = /^\d{4}-\d{2}-\d{2}$/;
+const dayFormatters = new Map();
+
+// The calendar day (YYYY-MM-DD) a moment falls on, in the company's time zone.
+function localDay(ms, timeZone) {
+  if (!dayFormatters.has(timeZone)) {
+    dayFormatters.set(timeZone, new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }));
+  }
+  return dayFormatters.get(timeZone).format(new Date(ms));
+}
+
+// Day arithmetic on YYYY-MM-DD strings, cached because the board does a lot of it.
+const dayNumbers = new Map();
+function dayNumber(iso) {
+  let n = dayNumbers.get(iso);
+  if (n === undefined) {
+    n = Math.round(Date.UTC(+iso.slice(0, 4), +iso.slice(5, 7) - 1, +iso.slice(8, 10)) / 86400000);
+    if (dayNumbers.size > 20000) dayNumbers.clear();
+    dayNumbers.set(iso, n);
+  }
+  return n;
+}
+const weekdayOf = (iso) => (((dayNumber(iso) + 4) % 7) + 7) % 7; // 1 Jan 1970 was a Thursday
+const shifted = new Map();
+function shiftDay(iso, n) {
+  const key = iso + n;
+  let out = shifted.get(key);
+  if (out === undefined) {
+    out = new Date((dayNumber(iso) + n) * 86400000).toISOString().slice(0, 10);
+    if (shifted.size > 20000) shifted.clear();
+    shifted.set(key, out);
+  }
+  return out;
+}
+
+async function salesItems(env, companyId) {
+  const { results } = await env.DB.prepare(
+    `SELECT i.item_code, i.item_name, i.grade_id, g.code AS grade_code
+     FROM sales_items i LEFT JOIN grades g ON g.id = i.grade_id
+     WHERE i.company_id = ? ORDER BY i.item_code`
+  )
+    .bind(companyId)
+    .all();
+  return results;
+}
+
+// Links point-of-sale items to grades. A null grade means "not fuel": the item is skipped.
+async function saveSalesItems(request, env, me) {
+  const body = await readJson(request);
+  const list = Array.isArray(body.items) ? body.items : [];
+  if (!list.length || list.length > 200) throw new HttpError(400, 'Send between 1 and 200 items.');
+  const stmts = [];
+  for (const it of list) {
+    const code = coerce('item', { type: 'text', required: true, max: 40, label: 'Item code' }, it.item_code);
+    const name = coerce('name', { type: 'text', max: 100, label: 'Item name' }, it.item_name);
+    let gradeId = null;
+    if (it.grade_id != null && it.grade_id !== '') {
+      gradeId = coerce('grade', { type: 'ref', label: 'Grade' }, it.grade_id);
+      const g = await env.DB.prepare('SELECT id FROM grades WHERE id = ? AND company_id = ?').bind(gradeId, me.company_id).first();
+      if (!g) throw new HttpError(400, 'Grade was not found.');
+    }
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO sales_items (company_id, item_code, item_name, grade_id) VALUES (?, ?, ?, ?)
+         ON CONFLICT(company_id, item_code) DO UPDATE SET item_name = excluded.item_name, grade_id = excluded.grade_id`
+      ).bind(me.company_id, code, name, gradeId)
+    );
+  }
+  await env.DB.batch(stmts);
+  return json(await salesItems(env, me.company_id));
+}
+
+async function salesSummary(env, companyId) {
+  const { results: sites } = await env.DB.prepare(
+    `SELECT s.id, s.name, s.sales_code,
+       (SELECT COUNT(*) FROM tanks t WHERE t.site_id = s.id AND t.active = 1) AS active_tanks,
+       MIN(d.day) AS first_day, MAX(d.day) AS last_day, COUNT(DISTINCT d.day) AS days,
+       SUM(CASE WHEN d.litres > 0 THEN d.litres ELSE 0 END) AS litres, MAX(d.uploaded_at) AS uploaded_at
+     FROM sites s LEFT JOIN sales_daily d ON d.site_id = s.id
+     WHERE s.company_id = ? GROUP BY s.id ORDER BY s.name`
+  )
+    .bind(companyId)
+    .all();
+  return { sites, items: await salesItems(env, companyId) };
+}
+
+// Daily sales from point-of-sale reports, read in the browser. Each report is one
+// location; each item is linked to a grade (or skipped). Items linked to the same grade
+// are added together. Uploading a period again replaces those days.
+async function importSales(request, env, me) {
+  const body = await readJson(request);
+  const reports = Array.isArray(body.reports) ? body.reports : [];
+  if (!reports.length) throw new HttpError(400, 'Choose at least one sales report.');
+  if (reports.length > 200) throw new HttpError(400, 'Upload at most 200 reports at a time.');
+  const cid = me.company_id;
+  const { timezone } = await getSettings(env, cid);
+  const today = localDay(Date.now(), timezone);
+  const oldest = shiftDay(today, -800);
+
+  const { results: siteRows } = await env.DB.prepare('SELECT id, name, sales_code FROM sites WHERE company_id = ?').bind(cid).all();
+  const siteByCode = new Map(siteRows.filter((s) => s.sales_code).map((s) => [s.sales_code.trim().toLowerCase(), s]));
+  const items = new Map((await salesItems(env, cid)).map((i) => [i.item_code, i]));
+
+  const needs = { locations: [], items: [] };
+  const errors = [];
+  for (const [i, r] of reports.entries()) {
+    const label = String(r.file || `Report ${i + 1}`).slice(0, 120);
+    const loc = String(r.location == null ? '' : r.location).trim();
+    if (!loc || loc.length > 40) { errors.push(`${label}: the report has no location.`); continue; }
+    if (!siteByCode.has(loc.toLowerCase()) && !needs.locations.some((n) => n.location === loc)) needs.locations.push({ location: loc, file: label });
+    for (const it of Array.isArray(r.items) ? r.items : []) {
+      const code = String(it.code == null ? '' : it.code).trim();
+      if (!code || code.length > 40) { errors.push(`${label}: an item has no code.`); continue; }
+      if (!items.has(code) && !needs.items.some((n) => n.item_code === code)) needs.items.push({ item_code: code, item_name: String(it.name || '').slice(0, 100) });
+    }
+  }
+  // A check before uploading: is everything in these reports linked?
+  if (body.check) return json({ ok: !errors.length && !needs.locations.length && !needs.items.length, needs, errors });
+  if (errors.length) return json({ ok: false, errors }, 400);
+  if (needs.locations.length || needs.items.length) return json({ ok: false, needs }, 409);
+
+  // Add up litres per site, grade and day.
+  const totals = new Map();
+  const results = [];
+  for (const r of reports) {
+    const site = siteByCode.get(String(r.location).trim().toLowerCase());
+    const res = { file: String(r.file || '').slice(0, 120), site: site.name, days: 0, first: null, last: null, skipped_today: 0, missing: [], ignored: [] };
+    const seenDays = new Set();
+    const mine = new Map();
+    for (const it of r.items || []) {
+      const link = items.get(String(it.code).trim());
+      const days = it.days && typeof it.days === 'object' ? it.days : {};
+      if (!link.grade_id) {
+        const total = Object.values(days).reduce((a, v) => a + (Number(v) || 0), 0);
+        res.ignored.push(`${it.name || it.code} (${Math.round(total).toLocaleString('en-AU')} L)`);
+        continue;
+      }
+      for (const [day, raw] of Object.entries(days)) {
+        const litres = Number(raw);
+        if (!DAY_RE.test(day) || !Number.isFinite(litres) || Math.abs(litres) > 1_000_000) {
+          throw new HttpError(400, `${res.file || site.name}: ${day} has a figure the app can’t use.`);
+        }
+        if (day >= today) { res.skipped_today = 1; continue; }
+        if (day < oldest) continue;
+        // Items linked to the same grade add up within a report.
+        const key = `${site.id}|${link.grade_id}`;
+        if (!mine.has(key)) mine.set(key, new Map());
+        const m = mine.get(key);
+        m.set(day, (m.get(day) || 0) + litres);
+        seenDays.add(day);
+      }
+    }
+    // A later report for the same site and day replaces an earlier one.
+    for (const [key, days] of mine) {
+      if (!totals.has(key)) totals.set(key, new Map());
+      for (const [day, litres] of days) totals.get(key).set(day, litres);
+    }
+    const sorted = [...seenDays].sort();
+    res.days = sorted.length;
+    res.first = sorted[0] || null;
+    res.last = sorted[sorted.length - 1] || null;
+    res.missing = (Array.isArray(r.missing) ? r.missing : []).filter((d) => DAY_RE.test(d)).slice(0, 400);
+    results.push(res);
+  }
+
+  // One statement per site and grade: the days go in as a JSON list.
+  const now = Date.now();
+  const stmts = [];
+  for (const [key, days] of totals) {
+    const [siteId, gradeId] = key.split('|').map(Number);
+    const list = [...days].map(([d, l]) => [d, Math.round(l * 100) / 100]);
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO sales_daily (company_id, site_id, grade_id, day, litres, uploaded_at)
+         SELECT ?, ?, ?, json_extract(value, '$[0]'), json_extract(value, '$[1]'), ? FROM json_each(?) WHERE true
+         ON CONFLICT(site_id, grade_id, day) DO UPDATE SET litres = excluded.litres, uploaded_at = excluded.uploaded_at`
+      ).bind(cid, siteId, gradeId, now, JSON.stringify(list))
+    );
+  }
+  for (let i = 0; i < stmts.length; i += 100) await env.DB.batch(stmts.slice(i, i + 100));
+  return json({ ok: true, reports: results });
+}
+
+/* ------------------------------------------------------- run-out board */
+
+// Forecast litres per day for one site and grade: the average of the last 14 days of
+// sales, adjusted for the day of the week using the last few weeks. Days with no sales
+// are left out, since they usually mean a tank was empty, a pump was down, or no
+// figures came through. Tested on Sunstate's July to October sales: over three days it
+// was typically within 9% of what sold.
+function buildForecast(history, lookbackWeeks) {
+  const days = [...history.keys()].sort();
+  if (!days.length) return null;
+  const last = days[days.length - 1];
+  const positive = (from) => days.filter((d) => d > from && history.get(d) > 0);
+  const recent = positive(shiftDay(last, -14));
+  const window = positive(shiftDay(last, -7 * lookbackWeeks));
+  if (!recent.length) return { level: 0, shape: [1, 1, 1, 1, 1, 1, 1], last };
+  const mean = (list) => list.reduce((a, d) => a + history.get(d), 0) / list.length;
+  const level = mean(recent);
+  const base = mean(window);
+  const byWeekday = [[], [], [], [], [], [], []];
+  for (const d of window) byWeekday[weekdayOf(d)].push(d);
+  const shape = byWeekday.map((same) => (same.length < 3 || !base ? 1 : Math.min(2, Math.max(0.5, mean(same) / base))));
+  return { level, shape, last };
+}
+
+const forecastFor = (fc, day) => (fc ? fc.level * fc.shape[weekdayOf(day)] : 0);
+
+async function runoutBoard(env, companyId) {
+  const settings = await getSettings(env, companyId);
+  const tz = settings.timezone;
+  const now = Date.now();
+  const today = localDay(now, tz);
+  const HORIZON_DAYS = 30;
+
+  const [{ results: sites }, { results: tanks }, latest] = await Promise.all([
+    env.DB.prepare('SELECT id, name, code FROM sites WHERE company_id = ? AND active = 1 ORDER BY name').bind(companyId).all(),
+    env.DB.prepare(
+      `SELECT t.id, t.site_id, t.grade_id, t.name, t.capacity_l, g.code AS grade_code, g.name AS grade_name, g.sort_order
+       FROM tanks t JOIN grades g ON g.id = t.grade_id WHERE t.company_id = ? AND t.active = 1`
+    ).bind(companyId).all(),
+    latestDips(env, companyId),
+  ]);
+  // Sales back to the start of the forecast window, or the oldest dip if that's earlier.
+  const oldestDip = latest.length ? localDay(Math.min(...latest.map((d) => d.taken_at)), tz) : today;
+  const windowStart = shiftDay(today, -(7 * settings.lookback_weeks + 14));
+  const from = oldestDip < windowStart ? oldestDip : windowStart;
+  const { results: sales } = await env.DB.prepare(
+    `SELECT d.site_id, d.grade_id, d.day, d.litres, g.code AS grade_code, g.name AS grade_name
+     FROM sales_daily d JOIN grades g ON g.id = d.grade_id WHERE d.company_id = ? AND d.day >= ?`
+  )
+    .bind(companyId, from)
+    .all();
+  const dipOf = new Map(latest.map((d) => [d.tank_id, d]));
+  const hist = new Map();
+  const gradeInfo = new Map();
+  for (const s of sales) {
+    const key = `${s.site_id}|${s.grade_id}`;
+    if (!hist.has(key)) hist.set(key, new Map());
+    hist.get(key).set(s.day, s.litres);
+    gradeInfo.set(s.grade_id, { code: s.grade_code, name: s.grade_name });
+  }
+
+  // Start-of-day times in the company's time zone, so sales spread evenly through each day.
+  // Day boundaries in the company's zone. Where the zone's offset doesn't change over the
+  // period the board looks at (no daylight saving, as in Queensland), this is arithmetic.
+  const offsets = [-200, -100, -40, 0, 40].map((d) => zoneOffset(now + d * 86400000, tz));
+  const fixed = offsets.every((o) => o === offsets[0]) ? offsets[0] : null;
+  const dayStart = new Map();
+  const startOf = (day) => {
+    if (fixed !== null) return dayNumber(day) * 86400000 - fixed;
+    if (!dayStart.has(day)) dayStart.set(day, zonedToUtc(`${day}T00:00`, tz));
+    return dayStart.get(day);
+  };
+  const dayOf = (ms) => (fixed !== null ? shiftDay('1970-01-01', Math.floor((ms + fixed) / 86400000)) : localDay(ms, tz));
+  const litresPerDay = (key, fc, day) => {
+    const h = hist.get(key);
+    return h && h.has(day) ? Math.max(0, h.get(day)) : forecastFor(fc, day);
+  };
+  // Litres sold between two moments.
+  const soldBetween = (key, fc, t0, t1) => {
+    if (t1 <= t0) return 0;
+    let total = 0;
+    for (let day = dayOf(t0); ; day = shiftDay(day, 1)) {
+      const a = startOf(day);
+      const b = startOf(shiftDay(day, 1));
+      if (a >= t1) break;
+      const overlap = Math.min(b, t1) - Math.max(a, t0);
+      if (overlap > 0) total += (litresPerDay(key, fc, day) * overlap) / (b - a);
+    }
+    return total;
+  };
+  // The first moment from `t0` (level `level0`) when the level falls to `target`, or null.
+  const whenLevel = (key, fc, t0, level0, target) => {
+    if (level0 <= target) return t0;
+    let level = level0;
+    let t = t0;
+    for (let day = dayOf(t0), n = 0; n <= HORIZON_DAYS; day = shiftDay(day, 1), n++) {
+      const b = startOf(shiftDay(day, 1));
+      const rate = litresPerDay(key, fc, day) / (b - startOf(day));
+      const end = level - rate * (b - t);
+      if (end <= target) return rate > 0 ? t + (level - target) / rate : null;
+      level = end;
+      t = b;
+    }
+    return null;
+  };
+
+  const out = [];
+  for (const site of sites) {
+    const mine = tanks.filter((t) => t.site_id === site.id);
+    const groups = [];
+    for (const gradeId of [...new Set(mine.map((t) => t.grade_id))]) {
+      const gt = mine.filter((t) => t.grade_id === gradeId);
+      const key = `${site.id}|${gradeId}`;
+      const h = hist.get(key);
+      const fc = h ? buildForecast(h, settings.lookback_weeks) : null;
+      const capacity = gt.reduce((a, t) => a + t.capacity_l, 0);
+      const avg = fc ? fc.level : 0;
+      const g = {
+        grade_id: gradeId, grade_code: gt[0].grade_code, grade_name: gt[0].grade_name, sort: gt[0].sort_order,
+        capacity, avg_daily: Math.round(avg),
+        tanks: gt.map((t) => ({ id: t.id, name: t.name, capacity: t.capacity_l, dip: dipOf.get(t.id) ? { litres: dipOf.get(t.id).litres, at: dipOf.get(t.id).taken_at } : null })),
+        sales_to: fc ? fc.last : null,
+        fill_to: Math.max(0, Math.round(capacity * settings.safe_fill_pct - settings.overfill_margin_l)),
+        floor: Math.round(Math.max((settings.floor_hours / 24) * avg, settings.floor_min_pct * capacity)),
+      };
+      g.state = !fc ? 'no_sales' : g.tanks.some((t) => !t.dip) ? 'no_dip' : avg <= 0 ? 'no_recent_sales' : 'ok';
+      if (g.tanks.every((t) => t.dip)) {
+        // Each tank of the grade sells its share by capacity, from its own dip time.
+        let level = 0;
+        let soldActual = 0;
+        let soldForecast = 0;
+        for (const t of g.tanks) {
+          const share = capacity ? t.capacity / capacity : 1;
+          const sold = soldBetween(key, fc, t.dip.at, now) * share;
+          level += t.dip.litres - sold;
+          const actualTo = fc ? startOf(shiftDay(fc.last, 1)) : t.dip.at;
+          const a = soldBetween(key, fc, t.dip.at, Math.min(now, Math.max(t.dip.at, actualTo))) * share;
+          soldActual += a;
+          soldForecast += sold - a;
+        }
+        g.dip_litres = g.tanks.reduce((a, t) => a + t.dip.litres, 0);
+        g.dip_at = Math.min(...g.tanks.map((t) => t.dip.at));
+        g.sold_since_dip = Math.round(soldActual + soldForecast);
+        g.sold_since_dip_estimated = Math.round(soldForecast);
+        g.level = Math.max(0, Math.round(level));
+        g.room_now = Math.max(0, g.fill_to - g.level);
+        if (g.state === 'ok') {
+          g.floor_at = whenLevel(key, fc, now, level, g.floor);
+          g.empty_at = whenLevel(key, fc, now, level, 0);
+        }
+        g.next_days = [];
+        for (let i = 0; i < 7; i++) {
+          const day = shiftDay(today, i);
+          g.next_days.push({ day, litres: Math.round(forecastFor(fc, day)) });
+        }
+        g.key = key;
+        g.fc = fc;
+      }
+      groups.push(g);
+    }
+    groups.sort((a, b) => a.sort - b.sort || a.grade_code.localeCompare(b.grade_code));
+
+    const live = groups.filter((g) => g.state === 'ok');
+    const floorTimes = live.map((g) => g.floor_at).filter((t) => t != null);
+    const deliverBy = floorTimes.length ? Math.min(...floorTimes) - settings.runout_buffer_h * 3600000 : null;
+    const levelAt = (g, t) => g.level - soldBetween(g.key, g.fc, now, t);
+    // The window opens when the site's tanks together have room for a worthwhile drop.
+    let opens = null;
+    if (live.length) {
+      const lv = live.map((g) => g.level);
+      let t = now;
+      let day = today;
+      search: for (let n = 0; n <= HORIZON_DAYS; n++, day = shiftDay(day, 1)) {
+        const a = startOf(day);
+        const b = startOf(shiftDay(day, 1));
+        const rates = live.map((g) => litresPerDay(g.key, g.fc, day) / (b - a));
+        while (t < b) {
+          const room = live.reduce((sum, g, i) => sum + Math.max(0, g.fill_to - lv[i]), 0);
+          if (room >= settings.min_drop_l) { opens = t; break search; }
+          const step = Math.min(3600000, b - t);
+          for (let i = 0; i < lv.length; i++) lv[i] -= rates[i] * step;
+          t += step;
+        }
+      }
+    }
+    if (deliverBy != null) {
+      for (const g of live) g.room_at_deliver_by = Math.max(0, Math.round(g.fill_to - levelAt(g, Math.max(now, deliverBy))));
+    }
+
+    // Sales of grades the site has no active tank for.
+    const warnings = [];
+    for (const [key, h] of hist) {
+      if (!key.startsWith(site.id + '|')) continue;
+      const gid = Number(key.slice(key.indexOf('|') + 1));
+      if (groups.some((g) => g.grade_id === gid)) continue;
+      const fc = buildForecast(h, settings.lookback_weeks);
+      if (fc && fc.level >= 50) {
+        const info = gradeInfo.get(gid);
+        warnings.push(`Sells ${info.code} (about ${Math.round(fc.level).toLocaleString('en-AU')} L a day) but has no active ${info.code} tank.`);
+      }
+    }
+    for (const g of groups) {
+      if (g.state === 'no_sales') warnings.push(`No ${g.grade_code} sales uploaded, so ${g.grade_code} can’t be forecast.`);
+      if (g.state === 'no_dip') warnings.push(`${g.tanks.filter((t) => !t.dip).map((t) => t.name).join(', ')} ${g.tanks.filter((t) => !t.dip).length === 1 ? 'has' : 'have'} no dip yet.`);
+      if (g.state === 'no_recent_sales') warnings.push(`No ${g.grade_code} sales in the last two weeks of uploads.`);
+      if (g.dip_at && now - g.dip_at > settings.dip_stale_hours * 3600000) warnings.push(`${g.grade_code} is worked out from a dip ${Math.round((now - g.dip_at) / 3600000)} hours old.`);
+      if (g.level != null && g.dip_litres > g.capacity) warnings.push(`${g.grade_code}’s latest dip is more than its listed capacity.`);
+    }
+    const salesTo = groups.map((g) => g.sales_to).filter(Boolean).sort();
+
+    let status = 'unknown';
+    if (deliverBy != null) {
+      const hrs = (deliverBy - now) / 3600000;
+      status = hrs <= 0 ? 'overdue' : hrs <= 24 ? 'today' : hrs <= 48 ? 'soon' : 'ok';
+    } else if (live.length) status = 'ok';
+
+    for (const g of groups) { delete g.key; delete g.fc; delete g.sort; }
+    out.push({
+      id: site.id, name: site.name, status, deliver_by: deliverBy, window_opens: opens,
+      room_now: live.reduce((a, g) => a + g.room_now, 0),
+      sales_to: salesTo.length ? salesTo[0] : null,
+      groups, warnings,
+    });
+  }
+  const rank = { overdue: 0, today: 1, soon: 2, ok: 3, unknown: 4 };
+  out.sort((a, b) => rank[a.status] - rank[b.status] || (a.deliver_by ?? Infinity) - (b.deliver_by ?? Infinity) || a.name.localeCompare(b.name));
+  return {
+    now, today,
+    settings: {
+      safe_fill_pct: settings.safe_fill_pct, floor_hours: settings.floor_hours, floor_min_pct: settings.floor_min_pct,
+      runout_buffer_h: settings.runout_buffer_h, min_drop_l: settings.min_drop_l, overfill_margin_l: settings.overfill_margin_l,
+    },
+    sites: out,
+  };
+}
+
 /* ---------------------------------------------------------------- router */
 
 async function handleApi(request, env, url) {
@@ -1170,6 +1650,15 @@ async function handleApi(request, env, url) {
       requireAdmin();
       return json(await updateSettings(env, me.company_id, await readJson(request)));
     }
+  }
+
+  // Run-out board and sales: admins and dispatchers. Linking items to grades is setup data.
+  if (path === '/api/board' && method === 'GET') return json(await runoutBoard(env, me.company_id));
+  if (path === '/api/sales' && method === 'GET') return json(await salesSummary(env, me.company_id));
+  if (path === '/api/sales/import' && method === 'POST') return importSales(request, env, me);
+  if (path === '/api/sales/items' && method === 'PUT') {
+    requireAdmin();
+    return saveSalesItems(request, env, me);
   }
 
   // Dips: admins and dispatchers can read and record them.

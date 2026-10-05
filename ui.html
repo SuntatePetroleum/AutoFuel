@@ -103,6 +103,23 @@
   .dip-hist li { display: flex; gap: 10px; align-items: center; padding: 10px 0; border-top: 1px solid var(--border); }
   .dip-hist li:first-child { border-top: 0; }
   .dip-hist .main { flex: 1; min-width: 0; }
+  .board-site { overflow: hidden; }
+  .board-site[data-status=overdue], .board-site[data-status=today] { box-shadow: inset 4px 0 0 var(--danger), var(--shadow); }
+  .board-site[data-status=soon] { box-shadow: inset 4px 0 0 var(--warn), var(--shadow); }
+  .bs-head { padding: 14px 16px 10px; }
+  .bs-title { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .bs-title a { font-weight: 650; font-size: 16px; color: var(--text); text-decoration: none; }
+  .bs-title a:hover { text-decoration: underline; }
+  .bs-when { margin-top: 6px; }
+  .bs-meta { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .bg-head, .bg-row { display: grid; grid-template-columns: 64px minmax(140px, 1.5fr) 0.9fr 1.2fr 1fr; gap: 12px; align-items: center; padding: 10px 16px; }
+  .bg-head { font-size: 12px; color: var(--muted); font-weight: 600; padding-top: 2px; padding-bottom: 6px; }
+  .bg-row { width: 100%; border: 0; border-top: 1px solid var(--border); background: none; text-align: left; cursor: pointer; color: inherit; font: inherit; }
+  .bg-row:hover { background: var(--surface-2); }
+  .bg-row .sub { display: block; font-size: 12px; color: var(--muted); }
+  .bg-now .level { margin-top: 6px; }
+  .bs-warn { margin: 0; padding: 10px 16px 12px 34px; border-top: 1px solid var(--border); color: var(--warn); background: var(--warn-soft); font-size: 13px; }
+  .bs-warn li + li { margin-top: 2px; }
 
   .details { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px 20px; }
   .details dt { font-size: 12px; color: var(--muted); }
@@ -169,7 +186,8 @@
     h1 { font-size: 20px; }
     .grid { grid-template-columns: 1fr; }
     .row { padding: 12px; }
-    .hide-sm { display: none; }
+    .hide-sm { display: none !important; }
+    .bg-row { grid-template-columns: 58px 1.4fr 1fr; gap: 10px; }
     main { padding-top: 16px; }
   }
 </style>
@@ -283,7 +301,7 @@ const FORMS = {
     { k: 'drop_minutes', label: 'Average drop time', type: 'number', step: 1, suffix: 'min' },
     { k: 'contact_name', label: 'Site contact' },
     { k: 'contact_phone', label: 'Contact phone' },
-    { k: 'sales_code', label: 'Sales code', hint: 'The code this site uses in sales exports' },
+    { k: 'sales_code', label: 'Idealpos location', hint: 'The location number on this site’s sales reports. Set automatically on the first upload.' },
     { k: 'active', label: 'Active', type: 'bool', def: 1 },
   ],
   tanks: [
@@ -499,7 +517,7 @@ function wireCompartments() {
 
 /* -------------------------------------------------------------- views */
 const NAV = [
-  ['sites', 'Sites'], ['dips', 'Dips'], ['tanks', 'Tanks'], ['trucks', 'Trucks'], ['grades', 'Grades'],
+  ['board', 'Board'], ['sites', 'Sites'], ['dips', 'Dips'], ['sales', 'Sales'], ['tanks', 'Tanks'], ['trucks', 'Trucks'], ['grades', 'Grades'],
   ['terminals', 'Terminals'], ['drivers', 'Drivers'], ['settings', 'Settings'], ['import', 'Import'], ['users', 'Users', true],
 ];
 
@@ -509,7 +527,7 @@ function shell(route, content) {
   return `
   <header class="top">
     <div class="bar">
-      <a class="brand" href="#/sites">${icon.logo}<span>Fuel Scheduler<small>${esc(state.me.company_name)}</small></span></a>
+      <a class="brand" href="#/board">${icon.logo}<span>Fuel Scheduler<small>${esc(state.me.company_name)}</small></span></a>
       <span class="spacer"></span>
       <div class="menu" id="menu">
         <button class="btn sm" id="menu-btn" aria-haspopup="true" aria-expanded="false">${esc(state.me.name.split(' ')[0])}</button>
@@ -572,7 +590,7 @@ async function viewSite(id) {
     `<div class="card pad"><dl class="details" style="margin:0">
       ${d('Site code', esc(s.code))}${d('Address', esc([s.address, s.postcode].filter(Boolean).join(' ')))}${d('Map', map)}
       ${d('Deliveries', deliveryText(s))}${d('Largest combination', esc(s.max_combination || 'Any'))}${d('Average drop time', s.drop_minutes != null ? s.drop_minutes + ' min' : '')}
-      ${d('Site contact', esc([s.contact_name, s.contact_phone].filter(Boolean).join(' · ')))}${d('Sales code', esc(s.sales_code))}${d('Price board site ID', esc(s.external_id))}
+      ${d('Site contact', esc([s.contact_name, s.contact_phone].filter(Boolean).join(' · ')))}${d('Idealpos location', esc(s.sales_code))}${d('Price board site ID', esc(s.external_id))}
     </dl></div>
     <div class="section">${headHtml('Tanks', mine.length ? `${plural(mine.length, 'tank')} · ${fmtL(mine.reduce((a, t) => a + t.capacity_l, 0))}` : '',
       (mine.some((t) => t.active) && canDip() ? `<button class="btn" data-dip-enter="${s.id}">Enter dips</button>` : '') +
@@ -654,13 +672,13 @@ async function viewDrivers() {
 const SETTINGS = [
   ['Tank limits', [
     { k: 'safe_fill_pct', label: 'Safe fill limit', pct: true, min: 50, max: 100, suffix: '% of capacity', hint: 'The most any delivery may fill a tank to.' },
-    { k: 'floor_days', label: 'Lowest level', suffix: 'days of sales', step: 'any', hint: 'Each tank’s lowest allowed level is this many days of its own average sales, worked out once sales are uploaded.' },
+    { k: 'floor_hours', label: 'Lowest level', suffix: 'hours of sales', step: 'any', hint: 'Each tank must be refilled before it falls below this many hours of its own average sales.' },
     { k: 'floor_min_pct', label: 'Lowest level is never below', pct: true, min: 0, max: 50, suffix: '% of capacity', hint: 'Keeps enough fuel above the pump in slow-selling tanks.' },
     { k: 'overfill_margin_l', label: 'Overfill margin', suffix: 'L', step: 1, hint: 'Litres left unused below the safe fill limit, to cover forecast and dip error.' },
   ]],
   ['Delivery planning', [
-    { k: 'runout_buffer_h', label: 'Run-out buffer', suffix: 'hours', step: 'any', hint: 'How long before a tank reaches its lowest level the delivery window closes.' },
-    { k: 'min_drop_l', label: 'Minimum worthwhile drop', suffix: 'L', step: 1, hint: 'The smallest total drop worth sending a truck for.' },
+    { k: 'runout_buffer_h', label: 'Extra margin', suffix: 'hours', step: 'any', hint: 'Brings every deliver-by time forward by this many hours. 0 means deliver by the time a tank reaches its lowest level.' },
+    { k: 'min_drop_l', label: 'Minimum worthwhile drop', suffix: 'L', step: 1, hint: 'A site’s delivery window opens once its tanks together have room for this much.' },
     { k: 'whole_compartments', label: 'Drop whole compartments only, so nothing comes back on the truck', type: 'bool' },
   ]],
   ['Forecast', [
@@ -1250,6 +1268,761 @@ function uploadDipsDialog() {
   $('#dlg [data-dip-template]').onclick = () => downloadDipTemplate().catch((err) => toast(err.message));
 }
 
+/* ------------------------------------------------- Idealpos PDF reading */
+// A small PDF text reader, enough for Idealpos (Crystal Reports) exports: plain or
+// Flate-compressed streams, literal or hex strings, positioned text. It returns each
+// page's text pieces with their position, merged where one word was drawn in parts.
+
+const PDF_WS = new Set([0, 9, 10, 12, 13, 32]);
+const PDF_DELIM = new Set('()<>[]{}/%'.split('').map((c) => c.charCodeAt(0)));
+
+function pdfLexer(str, pos = 0) {
+  const n = str.length;
+  const skip = () => {
+    for (;;) {
+      while (pos < n && PDF_WS.has(str.charCodeAt(pos))) pos++;
+      if (str[pos] === '%') { while (pos < n && str[pos] !== '\n' && str[pos] !== '\r') pos++; continue; }
+      return;
+    }
+  };
+  const readString = () => {
+    let depth = 1;
+    let out = '';
+    pos++;
+    while (pos < n && depth > 0) {
+      const c = str[pos++];
+      if (c === '\\') {
+        const e = str[pos++];
+        if (e === 'n') out += '\n';
+        else if (e === 'r') out += '\r';
+        else if (e === 't') out += '\t';
+        else if (e === 'b') out += '\b';
+        else if (e === 'f') out += '\f';
+        else if (e === '\r') { if (str[pos] === '\n') pos++; }
+        else if (e === '\n') { /* line continuation */ }
+        else if (e >= '0' && e <= '7') {
+          let oct = e;
+          while (oct.length < 3 && str[pos] >= '0' && str[pos] <= '7') oct += str[pos++];
+          out += String.fromCharCode(parseInt(oct, 8) & 255);
+        } else out += e;
+      } else if (c === '(') { depth++; out += c; }
+      else if (c === ')') { depth--; if (depth > 0) out += c; }
+      else out += c;
+    }
+    return { t: 'str', v: out };
+  };
+  const next = () => {
+    skip();
+    if (pos >= n) return null;
+    const c = str[pos];
+    if (c === '(') return readString();
+    if (c === '<') {
+      if (str[pos + 1] === '<') { pos += 2; return { t: 'op', v: '<<' }; }
+      const end = str.indexOf('>', pos);
+      const hex = str.slice(pos + 1, end).replace(/\s+/g, '');
+      pos = end + 1;
+      let out = '';
+      for (let i = 0; i < hex.length; i += 2) out += String.fromCharCode(parseInt((hex[i] + (hex[i + 1] || '0')), 16));
+      return { t: 'str', v: out };
+    }
+    if (c === '>' && str[pos + 1] === '>') { pos += 2; return { t: 'op', v: '>>' }; }
+    if (c === '[' || c === ']' || c === '{' || c === '}') { pos++; return { t: 'op', v: c }; }
+    if (c === '/') {
+      let j = pos + 1;
+      while (j < n && !PDF_WS.has(str.charCodeAt(j)) && !PDF_DELIM.has(str.charCodeAt(j))) j++;
+      const v = str.slice(pos + 1, j).replace(/#([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+      pos = j;
+      return { t: 'name', v };
+    }
+    let j = pos;
+    while (j < n && !PDF_WS.has(str.charCodeAt(j)) && !PDF_DELIM.has(str.charCodeAt(j))) j++;
+    if (j === pos) j++;
+    const word = str.slice(pos, j);
+    pos = j;
+    if (/^[+-]?(\d+\.?\d*|\.\d+)$/.test(word)) return { t: 'num', v: parseFloat(word) };
+    return { t: 'op', v: word };
+  };
+  return { next, get pos() { return pos; }, set pos(p) { pos = p; } };
+}
+
+// Parses one PDF value (dictionary, array, reference, name, number, string).
+function pdfValue(lex, first) {
+  const tok = first || lex.next();
+  if (!tok) return null;
+  if (tok.t === 'op' && tok.v === '<<') {
+    const dict = {};
+    for (;;) {
+      const k = lex.next();
+      if (!k || (k.t === 'op' && k.v === '>>')) break;
+      dict[k.v] = pdfValue(lex);
+    }
+    return dict;
+  }
+  if (tok.t === 'op' && tok.v === '[') {
+    const arr = [];
+    for (;;) {
+      const t = lex.next();
+      if (!t || (t.t === 'op' && t.v === ']')) break;
+      arr.push(pdfValue(lex, t));
+    }
+    return arr;
+  }
+  if (tok.t === 'num' && Number.isInteger(tok.v)) {
+    const save = lex.pos;
+    const t2 = lex.next();
+    if (t2 && t2.t === 'num' && Number.isInteger(t2.v)) {
+      const t3 = lex.next();
+      if (t3 && t3.t === 'op' && t3.v === 'R') return { ref: tok.v };
+    }
+    lex.pos = save;
+    return tok.v;
+  }
+  if (tok.t === 'op' && (tok.v === 'true' || tok.v === 'false')) return tok.v === 'true';
+  if (tok.t === 'op' && tok.v === 'null') return null;
+  return tok.v;
+}
+
+async function inflate(bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('deflate'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+const latin1 = (bytes) => {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 8192) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 8192));
+  return s;
+};
+
+async function pdfDocument(buffer) {
+  const bytes = new Uint8Array(buffer);
+  const text = latin1(bytes);
+  if (!text.startsWith('%PDF')) throw new Error('That file isn’t a PDF.');
+  const offsets = new Map();
+  const re = /(\d+)\s+(\d+)\s+obj\b/g;
+  let m;
+  while ((m = re.exec(text))) offsets.set(Number(m[1]), m.index + m[0].length);
+  const cache = new Map();
+  const object = (num) => {
+    if (cache.has(num)) return cache.get(num);
+    const at = offsets.get(num);
+    if (at === undefined) throw new Error('This PDF is damaged or uses a format the app can’t read.');
+    const lex = pdfLexer(text, at);
+    const value = pdfValue(lex);
+    let result = { value };
+    const after = lex.pos;
+    const sm = /^\s*stream(\r\n|\n|\r)?/.exec(text.slice(after, after + 20));
+    if (sm) {
+      const start = after + sm[0].length;
+      let len = value && value.Length;
+      if (len && typeof len === 'object') len = resolve(len);
+      let end = typeof len === 'number' ? start + len : text.indexOf('endstream', start);
+      if (text.slice(end, end + 30).indexOf('endstream') < 0) end = text.indexOf('endstream', start);
+      result.stream = bytes.subarray(start, end);
+    }
+    cache.set(num, result);
+    return result;
+  };
+  const resolve = (v) => (v && typeof v === 'object' && 'ref' in v ? object(v.ref).value : v);
+  const streamData = async (num) => {
+    const o = object(num);
+    if (!o.stream) return new Uint8Array();
+    let filters = resolve(o.value.Filter);
+    filters = filters ? (Array.isArray(filters) ? filters : [filters]) : [];
+    let data = o.stream;
+    for (const f of filters) {
+      if (f !== 'FlateDecode') throw new Error(`This PDF uses ${f} compression, which the app can’t read.`);
+      data = await inflate(data);
+    }
+    return data;
+  };
+  const trailerAt = text.lastIndexOf('trailer');
+  let root;
+  if (trailerAt >= 0) root = resolve(pdfValue(pdfLexer(text, trailerAt + 7)).Root);
+  else {
+    for (const num of offsets.keys()) {
+      const v = object(num).value;
+      if (v && v.Type === 'Catalog') { root = v; break; }
+    }
+  }
+  if (!root) throw new Error('This PDF is damaged or uses a format the app can’t read.');
+  const pages = [];
+  const walk = (node, inherited) => {
+    node = resolve(node);
+    const res = node.Resources ? resolve(node.Resources) : inherited;
+    if (node.Type === 'Pages' || node.Kids) for (const k of resolve(node.Kids) || []) walk(k, res);
+    else pages.push({ node, resources: res });
+  };
+  walk(root.Pages, null);
+  return { pages, resolve, streamData };
+}
+
+// Every piece of text on each page, with x and y (y grows downwards), font size and
+// an estimated width from the font's glyph widths.
+async function pdfPageText(doc, page) {
+  const { resolve, streamData } = doc;
+  const fontsRes = page.resources ? resolve(resolve(page.resources).Font) || {} : {};
+  const fonts = {};
+  for (const [name, ref] of Object.entries(fontsRes)) {
+    const f = resolve(ref) || {};
+    fonts[name] = { first: resolve(f.FirstChar) || 0, widths: (resolve(f.Widths) || []).map(resolve) };
+  }
+  let contents = resolve(page.node.Contents);
+  const refs = Array.isArray(page.node.Contents) ? page.node.Contents : Array.isArray(contents) ? contents : [page.node.Contents];
+  let src = '';
+  for (const r of refs) if (r && r.ref) src += latin1(await streamData(r.ref)) + '\n';
+
+  const mul = (a, b) => [
+    a[0] * b[0] + a[1] * b[2], a[0] * b[1] + a[1] * b[3],
+    a[2] * b[0] + a[3] * b[2], a[2] * b[1] + a[3] * b[3],
+    a[4] * b[0] + a[5] * b[2] + b[4], a[4] * b[1] + a[5] * b[3] + b[5],
+  ];
+  let ctm = [1, 0, 0, 1, 0, 0];
+  const stack = [];
+  let tm = [1, 0, 0, 1, 0, 0];
+  let tlm = [1, 0, 0, 1, 0, 0];
+  let font = null;
+  let size = 0;
+  let leading = 0;
+  const pieces = [];
+  const ops = [];
+  const lex = pdfLexer(src);
+  const widthOf = (s, kern) => {
+    const f = fonts[font] || { first: 0, widths: [] };
+    let w = 0;
+    for (let i = 0; i < s.length; i++) {
+      const g = f.widths[s.charCodeAt(i) - f.first];
+      w += typeof g === 'number' && g > 0 ? g : 556;
+    }
+    return ((w - kern) / 1000) * size;
+  };
+  const show = (s, kern = 0) => {
+    const m = mul(tm, ctm);
+    const w = widthOf(s, kern);
+    pieces.push({ s, x: m[4], y: m[5], size: Math.abs(size * m[3]) || size, w: w * Math.hypot(m[0], m[1]) });
+    tm = mul([1, 0, 0, 1, w, 0], tm);
+  };
+  for (let tok = lex.next(); tok; tok = lex.next()) {
+    if (tok.t !== 'op' || tok.v === '[' || tok.v === '<<') {
+      ops.push(tok.t === 'op' ? pdfValue(lex, tok) : tok.v);
+      continue;
+    }
+    const a = ops.splice(0);
+    switch (tok.v) {
+      case 'q': stack.push(ctm); break;
+      case 'Q': ctm = stack.pop() || [1, 0, 0, 1, 0, 0]; break;
+      case 'cm': ctm = mul(a.slice(0, 6), ctm); break;
+      case 'BT': tm = tlm = [1, 0, 0, 1, 0, 0]; break;
+      case 'Tf': font = a[0]; size = a[1]; break;
+      case 'TL': leading = a[0]; break;
+      case 'Tm': tm = tlm = a.slice(0, 6); break;
+      case 'Td': tm = tlm = mul([1, 0, 0, 1, a[0], a[1]], tlm); break;
+      case 'TD': leading = -a[1]; tm = tlm = mul([1, 0, 0, 1, a[0], a[1]], tlm); break;
+      case 'T*': tm = tlm = mul([1, 0, 0, 1, 0, -leading], tlm); break;
+      case 'Tj': if (typeof a[0] === 'string') show(a[0]); break;
+      case "'": tm = tlm = mul([1, 0, 0, 1, 0, -leading], tlm); if (typeof a[0] === 'string') show(a[0]); break;
+      case '"': tm = tlm = mul([1, 0, 0, 1, 0, -leading], tlm); if (typeof a[2] === 'string') show(a[2]); break;
+      case 'TJ': {
+        let s = '';
+        let kern = 0;
+        for (const part of a[0] || []) {
+          if (typeof part === 'string') s += part;
+          else if (typeof part === 'number') kern += part;
+        }
+        show(s, kern);
+        break;
+      }
+      default: break;
+    }
+  }
+  // Device space has y growing upwards; flip so rows sort top to bottom.
+  for (const p of pieces) p.y = -p.y;
+  // Join pieces of one word drawn separately (like "1" "1" "/07/2026").
+  pieces.sort((p, q) => (Math.abs(p.y - q.y) > 1 ? p.y - q.y : p.x - q.x));
+  const merged = [];
+  for (const p of pieces) {
+    const last = merged[merged.length - 1];
+    if (last && Math.abs(last.y - p.y) <= 1 && p.x - (last.x + last.w) < Math.max(0.6, p.size * 0.12) && p.x >= last.x) {
+      last.s += p.s;
+      last.w = p.x + p.w - last.x;
+    } else merged.push({ ...p });
+  }
+  for (const p of merged) p.s = p.s.replace(/\s+/g, ' ').trim();
+  return merged.filter((p) => p.s !== '');
+}
+
+const MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+const isoDay = (y, m, d) => `${y}-${String(m).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+const addDays = (iso, n) => {
+  const d = new Date(iso + 'T00:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+};
+
+// Reads an Idealpos "Stock Item Sales Trend Report" (daily) into litres per item per day,
+// and checks every figure against the report's own row and column totals.
+async function readIdealposTrend(buffer) {
+  const doc = await pdfDocument(buffer);
+  if (!doc.pages.length) throw new Error('This PDF has no pages.');
+  const pages = [];
+  for (const p of doc.pages) pages.push(await pdfPageText(doc, p));
+  const all = pages.flat();
+  const find = (re) => { for (const p of all) { const m = p.s.match(re); if (m) return m; } return null; };
+  if (!find(/Sales Trend Report/i)) throw new Error('This isn’t an Idealpos Stock Item Sales Trend Report.');
+  const range = find(/(\d{1,2}) ([A-Za-z]{3}) (\d{4}) [\d:]+ to (\d{1,2}) ([A-Za-z]{3}) (\d{4})/);
+  const scope = find(/Loc ([^\s,]+) to ([^\s,]+).*List: (\w+)/i);
+  if (!range || !scope) throw new Error('Couldn’t find the report’s date range and location.');
+  if (scope[1] !== scope[2]) throw new Error(`This report covers locations ${scope[1]} to ${scope[2]}. Run it for one location at a time.`);
+  if (scope[3].toLowerCase() !== 'daily') throw new Error(`This report is listed by ${scope[3].toLowerCase()}. Run it with List set to Daily.`);
+  const start = isoDay(+range[3], MONTHS[range[2].toLowerCase()], +range[1]);
+  const end = isoDay(+range[6], MONTHS[range[5].toLowerCase()], +range[4]);
+
+  const DATE = /^(\d{2})\/(\d{2})\/(\d{4})$/;
+  const NUM = /^-?[\d,]*\.?\d+$/;
+  const rowsOf = (pieces) => {
+    const rows = [];
+    for (const p of pieces.filter((x) => NUM.test(x.s)).sort((a, b) => a.y - b.y || a.x - b.x)) {
+      const row = rows.find((r) => Math.abs(r.y - p.y) <= 2);
+      if (row) row.cells.push(p);
+      else rows.push({ y: p.y, cells: [p] });
+    }
+    for (const r of rows) r.cells.sort((a, b) => a.x - b.x);
+    return rows;
+  };
+
+  // Item labels ("99902 E10") and the Total row are on the first page.
+  const first = pages[0];
+  const items = first
+    .filter((p) => /^\d{3,} \S/.test(p.s) && !DATE.test(p.s) && p.x < 200)
+    .sort((a, b) => a.y - b.y)
+    .map((p) => {
+      const [, code, name] = p.s.match(/^(\d+) (.+)$/);
+      return { code, name, y: p.y, days: {} };
+    });
+  if (!items.length) throw new Error('Couldn’t find any stock items in this report.');
+
+  const dayTotals = {};
+  let itemTotals = null;
+  let lastDay = '';
+  for (const pg of pages) {
+    const heads = pg.filter((p) => (DATE.test(p.s) || p.s === 'Total') && p.y < items[0].y - 2);
+    const dateHeads = heads.filter((p) => DATE.test(p.s)).sort((a, b) => a.x - b.x);
+    if (!dateHeads.length) continue;
+    const hasTotalCol = heads.some((p) => p.s === 'Total' && p.x > dateHeads[dateHeads.length - 1].x);
+    const rows = rowsOf(pg.filter((p) => p.y > dateHeads[0].y + 2));
+    if (rows.length !== items.length + 1) throw new Error('The report’s layout wasn’t what the app expected, so nothing was read from it.');
+    const cols = dateHeads.length + (hasTotalCol ? 1 : 0);
+    rows.forEach((r, i) => {
+      if (r.cells.length !== cols) throw new Error('A row in the report has missing figures, so nothing was read from it.');
+      const values = r.cells.map((c) => Number(c.s.replace(/,/g, '')));
+      dateHeads.forEach((h, j) => {
+        const [, d, mo, y] = h.s.match(DATE);
+        const iso = isoDay(+y, +mo, +d);
+        if (i === 0) {
+          if (iso <= lastDay || iso < start || iso > end) throw new Error('The report’s dates aren’t in order, so nothing was read from it.');
+          lastDay = iso;
+        }
+        if (i < items.length) items[i].days[iso] = values[j];
+        else dayTotals[iso] = values[j];
+      });
+      if (hasTotalCol) {
+        itemTotals = itemTotals || [];
+        itemTotals[i] = values[cols - 1];
+      }
+    });
+  }
+
+  // Check against the report's own totals. Days the report leaves out (no figures
+  // reached Idealpos) are listed as missing, not treated as zero sales.
+  const days = Object.keys(dayTotals).sort();
+  if (!days.length) throw new Error('No daily figures were found in this report.');
+  const missing = [];
+  for (let d = start; d <= end; d = addDays(d, 1)) if (!(d in dayTotals)) missing.push(d);
+  const close = (a, b) => Math.abs(a - b) <= 0.02 + Math.abs(b) * 1e-9;
+  for (const d of days) {
+    const sum = items.reduce((a, it) => a + (it.days[d] || 0), 0);
+    if (!close(Math.round(sum * 100) / 100, dayTotals[d])) throw new Error(`The figures for ${d} don’t add up to the report’s total, so nothing was taken from it.`);
+  }
+  if (!itemTotals) throw new Error('Couldn’t find the report’s Total column.');
+  items.forEach((it, i) => {
+    const sum = days.reduce((a, d) => a + it.days[d], 0);
+    if (!close(Math.round(sum * 100) / 100, itemTotals[i])) throw new Error(`${it.name}’s figures don’t add up to its total, so nothing was taken from this report.`);
+  });
+  return { location: scope[1], start, end, missing, items: items.map(({ code, name, days: d }) => ({ code, name, days: d })) };
+}
+
+/* ------------------------------------------------------- run-out board */
+const STATUS = {
+  overdue: ['bad', 'Overdue'],
+  today: ['bad', 'Within 24 h'],
+  soon: ['warn', 'Within 48 h'],
+  ok: ['ok', 'OK'],
+  unknown: ['off', 'Can’t forecast yet'],
+};
+
+function rel(ms) {
+  const mins = Math.round((ms - Date.now()) / 60000);
+  const a = Math.abs(mins);
+  const txt = a < 60 ? `${a} min` : a < 48 * 60 ? `${Math.round(a / 60)} h` : `${Math.round(a / 1440)} days`;
+  return mins >= 0 ? `in ${txt}` : `${txt} ago`;
+}
+
+function fmtDayShort(iso) {
+  return new Intl.DateTimeFormat('en-AU', { timeZone: 'UTC', weekday: 'short', day: 'numeric', month: 'short' }).format(new Date(iso + 'T00:00:00Z'));
+}
+
+function boardSiteHtml(s, b) {
+  const [kind, label] = STATUS[s.status];
+  const due = s.deliver_by != null;
+  const when = due
+    ? (s.deliver_by <= b.now + 60000
+      ? `<strong>Deliver now</strong> · a tank is at or below its lowest level`
+      : `<strong>Deliver by ${esc(fmtWhen(s.deliver_by))}</strong> · ${rel(s.deliver_by)}`)
+    : s.status === 'ok' ? '<strong>No delivery needed</strong> in the next 30 days' : '<strong>Not enough data</strong> to forecast';
+  const opens = s.window_opens == null ? '' : s.window_opens <= b.now + 60000 ? 'Room for a delivery now' : `Room for a delivery from ${esc(fmtWhen(s.window_opens))}`;
+  const live = s.groups.filter((g) => g.state === 'ok').length;
+  const partial = live && live < s.groups.length ? `<strong>${live} of ${s.groups.length} grades forecast</strong>` : '';
+  const rows = s.groups.map((g) => {
+    if (g.level == null) {
+      return `<button class="bg-row" data-board-grade="${s.id}:${g.grade_id}"><span class="chip">${esc(g.grade_code)}</span>
+        <span class="bg-now muted">${g.state === 'no_sales' ? 'No sales uploaded' : 'No dip yet'}</span><span class="bg-cell hide-sm"></span><span class="bg-cell"></span><span class="bg-cell hide-sm"></span></button>`;
+    }
+    const p = pct(g.level, g.capacity);
+    const below = g.level <= g.floor;
+    const lowest = g.state !== 'ok' ? '<span class="muted">—</span>'
+      : g.floor_at == null ? '<span class="muted">30+ days</span>'
+      : below ? '<span class="badge bad">Below now</span>'
+      : `${esc(rel(g.floor_at).replace('in ', ''))}<span class="sub">${esc(fmtWhen(g.floor_at))}</span>`;
+    return `<button class="bg-row" data-board-grade="${s.id}:${g.grade_id}">
+      <span class="chip">${esc(g.grade_code)}</span>
+      <span class="bg-now"><strong class="num">${fmtL(g.level)}</strong> <span class="muted">${p}%</span>${levelBar(g.level, g.capacity)}</span>
+      <span class="bg-cell hide-sm num">${fmtN(g.avg_daily)}<span class="sub">L a day</span></span>
+      <span class="bg-cell num">${lowest}</span>
+      <span class="bg-cell hide-sm num">${g.room_at_deliver_by != null ? fmtL(g.room_at_deliver_by) : '<span class="muted">—</span>'}<span class="sub">room by then</span></span>
+    </button>`;
+  }).join('');
+  return `<div class="card board-site" data-status="${s.status}" data-name="${esc(s.name.toLowerCase())}" data-flags="${s.warnings.length ? 1 : 0}">
+    <div class="bs-head">
+      <div class="bs-title"><a href="#/sites/${s.id}">${esc(s.name)}</a><span class="badge ${kind}">${label}</span></div>
+      <div class="bs-when">${when}</div>
+      <div class="bs-meta">${[partial, opens, s.room_now ? `${fmtL(s.room_now)} room now` : '', s.sales_to ? `sales to ${esc(fmtDayShort(s.sales_to))}` : ''].filter(Boolean).join(' · ')}</div>
+    </div>
+    ${s.groups.length ? `<div class="bg-head hide-sm"><span>Grade</span><span>Estimated now</span><span>Sells</span><span>Reaches lowest level</span><span>Room at deliver-by</span></div>${rows}` : '<div class="empty">No active tanks.</div>'}
+    ${s.warnings.length ? `<ul class="bs-warn">${s.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}
+  </div>`;
+}
+
+async function viewBoard() {
+  const b = await api('/board');
+  state.board = b;
+  const count = (st) => b.sites.filter((s) => s.status === st).length;
+  const flagged = b.sites.filter((s) => s.warnings.length && s.groups.length).length;
+  const salesTo = b.sites.map((s) => s.sales_to).filter(Boolean).sort();
+  const st = b.settings;
+  const sub = `Forecast from the latest dips and sales${salesTo.length ? ` up to ${esc(fmtDayShort(salesTo[salesTo.length - 1]))}` : ''}. ` +
+    `Tanks fill to ${Math.round(st.safe_fill_pct * 100)}% and must be refilled before they fall below ${fmtN(st.floor_hours)} hours of sales` +
+    `${st.runout_buffer_h ? `, with ${fmtN(st.runout_buffer_h)} hours’ extra margin` : ''}. <a href="#/settings">Change</a>`;
+  if (!b.sites.some((s) => s.groups.length)) {
+    return headHtml('Run-out board', sub) + `<div class="card">${emptyHtml('Nothing to show yet', 'Add sites and tanks, then enter dips and upload sales.')}</div>`;
+  }
+  return headHtml('Run-out board', sub, '<button class="btn" data-act="board-refresh">Refresh</button>') +
+    `<div class="stats"><span><strong>${count('overdue')}</strong> overdue</span><span><strong>${count('today')}</strong> within 24 h</span>
+      <span><strong>${count('soon')}</strong> within 48 h</span><span><strong>${count('unknown')}</strong> can’t forecast</span><span><strong>${flagged}</strong> with notes</span></div>
+    <div class="toolbar"><input type="text" id="bq" placeholder="Search sites" aria-label="Search sites">
+      <select id="bfilter" aria-label="Which sites"><option value="">All sites</option><option value="due">Delivery within 48 h</option><option value="flags">Sites with notes</option></select></div>
+    <div id="board-list" style="display:grid;gap:16px">${b.sites.filter((s) => s.groups.length && s.status !== 'unknown').map((s) => boardSiteHtml(s, b)).join('')}</div>
+    ${unknownHtml(b.sites.filter((s) => s.groups.length && s.status === 'unknown'))}
+    <p class="muted" style="font-size:13px;margin-top:16px">Estimates assume no deliveries since each tank’s latest dip, so enter a dip after every delivery. Sales are spread evenly through each day. Updated ${esc(fmtWhen(b.now))}.</p>`;
+}
+
+function unknownHtml(sites) {
+  if (!sites.length) return '';
+  const why = (s) => {
+    const noDip = s.groups.filter((g) => g.state === 'no_dip').reduce((a, g) => a + g.tanks.filter((t) => !t.dip).length, 0);
+    const noSales = s.groups.filter((g) => g.state === 'no_sales').length;
+    const quiet = s.groups.filter((g) => g.state === 'no_recent_sales').length;
+    return [
+      noDip ? `${plural(noDip, 'tank')} without a dip` : '',
+      noSales === s.groups.length ? 'no sales uploaded' : noSales ? `no sales for ${plural(noSales, 'grade')}` : '',
+      quiet ? `no recent sales for ${plural(quiet, 'grade')}` : '',
+    ].filter(Boolean).join(' · ');
+  };
+  return `<div class="section" id="board-unknown">${headHtml('Can’t forecast yet', 'Each site needs a dip for every active tank and its sales uploaded.')}
+    <div class="card"><ul class="rows">${sites.map((s) => `<li class="board-site" data-status="unknown" data-name="${esc(s.name.toLowerCase())}" data-flags="1" style="box-shadow:none">
+      <a class="row" href="#/sites/${s.id}"><div class="main"><div class="title">${esc(s.name)}</div><div class="meta">${esc(why(s))}</div></div>${icon.chev}</a></li>`).join('')}</ul></div></div>`;
+}
+
+function boardGradeDialog(siteId, gradeId) {
+  const b = state.board;
+  const s = b && b.sites.find((x) => x.id === siteId);
+  const g = s && s.groups.find((x) => x.grade_id === gradeId);
+  if (!g) return;
+  const st = b.settings;
+  const row = (label, value) => `<div><dt>${esc(label)}</dt><dd>${value}</dd></div>`;
+  let body;
+  if (g.level == null) {
+    body = g.state === 'no_sales'
+      ? emptyHtml('No sales for this grade', `Upload this site’s sales on the Sales screen. If the site doesn’t sell ${esc(g.grade_code)}, mark the tank inactive on the Tanks screen.`)
+      : emptyHtml('No dip yet', `Enter a dip for ${esc(g.tanks.filter((t) => !t.dip).map((t) => t.name).join(', '))} on the Dips screen.`);
+  } else {
+    const dips = g.tanks.map((t) => `${g.tanks.length > 1 ? esc(t.name) + ': ' : ''}${fmtL(t.dip.litres)}, ${esc(fmtWhen(t.dip.at))}`).join('<br>');
+    const floorWhy = g.floor > (st.floor_hours / 24) * g.avg_daily + 1 ? `${Math.round(st.floor_min_pct * 100)}% of capacity` : `${fmtN(st.floor_hours)} hours of sales`;
+    body = `<dl class="details" style="margin:0">
+        ${row(g.tanks.length > 1 ? 'Latest dips' : 'Latest dip', dips)}
+        ${row('Sold since', `${fmtL(g.sold_since_dip)}${g.sold_since_dip_estimated ? `<div class="hint">${fmtL(g.sold_since_dip_estimated)} of it estimated${g.sales_to ? `, as sales after ${esc(fmtDayShort(g.sales_to))} aren’t uploaded yet` : ''}</div>` : ''}`)}
+        ${row('Estimated now', `${fmtL(g.level)} (${pct(g.level, g.capacity)}%)`)}
+        ${row('Capacity', fmtL(g.capacity))}
+        ${row('Fills to', `${fmtL(g.fill_to)}<div class="hint">${Math.round(st.safe_fill_pct * 100)}% of capacity, less ${fmtL(st.overfill_margin_l)} margin</div>`)}
+        ${row('Room now', fmtL(g.room_now))}
+        ${row('Average sales', `${fmtL(g.avg_daily)} a day<div class="hint">Last 2 weeks, adjusted for the day of the week</div>`)}
+        ${row('Lowest level', `${fmtL(g.floor)}<div class="hint">${esc(floorWhy)}</div>`)}
+        ${row('Reaches lowest level', g.floor_at == null ? 'Not in the next 30 days' : g.floor_at <= b.now + 60000 ? 'Already at or below it' : `${esc(fmtWhen(g.floor_at))}<div class="hint">${rel(g.floor_at)}</div>`)}
+        ${row('Runs empty', g.empty_at == null ? 'Not in the next 30 days' : g.empty_at <= b.now + 60000 ? 'Estimated empty now' : `${esc(fmtWhen(g.empty_at))}<div class="hint">${rel(g.empty_at)}</div>`)}
+      </dl>
+      <h2 style="margin:18px 0 8px">Forecast sales</h2>
+      <table class="summary"><tbody>${g.next_days.map((d) => `<tr><td>${esc(fmtDayShort(d.day))}</td><td class="n">${fmtL(d.litres)}</td></tr>`).join('')}</tbody></table>`;
+  }
+  openDialog({ title: `${s.name} · ${g.grade_code}`, sub: g.grade_name, readOnly: true, body });
+}
+
+/* --------------------------------------------------------------- sales */
+const normWords = (s) => String(s || '').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, ' ').trim();
+
+function editDistance(a, b) {
+  if (Math.abs(a.length - b.length) > 2) return 9;
+  const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    let prev = row[0];
+    row[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const tmp = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = tmp;
+    }
+  }
+  return row[b.length];
+}
+
+// Best guess at which site a report belongs to, from its file name.
+function guessSite(fileName, sites) {
+  const skip = new Set(['sales', 'sale', 'pdf', 'report', 'trend', 'stock', 'item', 'items', 'idealpos']);
+  const words = normWords(fileName.replace(/\.pdf$/i, '').replace(/([a-z])([A-Z])/g, '$1 $2')).split(' ').filter((w) => w.length >= 3 && !skip.has(w) && !/^\d+$/.test(w));
+  const squashedFile = normWords(fileName.replace(/\.pdf$/i, '')).replace(/ /g, '');
+  let best = null;
+  let bestScore = 0;
+  let tie = false;
+  for (const s of sites) {
+    const siteWords = normWords([s.name, s.trading_name, s.address].join(' ')).split(' ').filter((w) => w.length >= 3);
+    const squashed = normWords(s.name).replace(/ /g, '');
+    let score = squashedFile.includes(squashed) ? 2 : 0;
+    for (const w of words) {
+      if (siteWords.some((x) => x === w || (w.length >= 5 && editDistance(x, w) <= 1))) score++;
+    }
+    if (score > bestScore) { best = s; bestScore = score; tie = false; }
+    else if (score === bestScore && score > 0) tie = true;
+  }
+  return bestScore > 0 && !tie ? best : null;
+}
+
+// Best guess at which grade a point-of-sale item is (null: not fuel).
+function guessGrade(name, grades) {
+  const n = normWords(name);
+  const byCode = (code) => grades.find((g) => g.code.toUpperCase() === code) || null;
+  const byName = (re) => grades.find((g) => re.test(normWords(g.name))) || null;
+  if (/adblue|lpg|oil|wash|gas|kero|bottle/.test(n)) return null;
+  if (/prem\w* diesel|pdsl|premium diesel|vortex diesel|v power diesel/.test(n)) return byCode('PDSL') || byName(/premium diesel/);
+  if (/diesel|dsl|ulsd/.test(n)) return byCode('DSL') || byName(/^diesel/);
+  if (/e ?85/.test(n)) return byCode('E85') || byName(/e85/);
+  if (/e ?10/.test(n)) return byCode('E10') || byName(/e10/);
+  if (/98/.test(n)) return byCode('ULP98') || byName(/98/);
+  if (/95/.test(n)) return byCode('ULP95') || byName(/95/);
+  if (/ulp|unleaded|91|petrol/.test(n)) return byCode('ULP91') || byName(/91|unleaded/);
+  return undefined;
+}
+
+async function viewSales() {
+  const data = await api('/sales');
+  state.salesData = data;
+  const withData = data.sites.filter((s) => s.days > 0);
+  const latest = withData.map((s) => s.last_day).sort().pop();
+  const rows = data.sites.filter((s) => s.days > 0 || s.active_tanks > 0).map((s) => `
+    <li><a class="row" href="#/sites/${s.id}">
+      <div class="main"><div class="title">${esc(s.name)} ${s.days ? '' : '<span class="badge warn">No sales yet</span>'}</div>
+        <div class="meta">${s.sales_code ? `Idealpos location ${esc(s.sales_code)}` : 'Not linked to an Idealpos location'}</div></div>
+      <div class="side">${s.days ? `<strong>${esc(fmtDayShort(s.first_day))} – ${esc(fmtDayShort(s.last_day))}</strong><br>${plural(s.days, 'day')} · ${fmtL(s.litres / s.days)} a day` : ''}</div>${icon.chev}</a></li>`).join('');
+  const links = data.items.map((i) => `<li><div class="row" style="cursor:default">
+      <div class="main"><div class="title">${esc(i.item_code)} ${esc(i.item_name || '')}</div></div>
+      <div class="side">${i.grade_code ? `<span class="chip">${esc(i.grade_code)}</span>` : '<span class="muted">Not fuel, skipped</span>'}</div></div></li>`).join('');
+  return headHtml('Sales', `Daily litres sold, from Idealpos Stock Item Sales Trend reports.${latest ? ` Latest day uploaded: ${esc(fmtDayShort(latest))}.` : ''}`) +
+    `<div class="drop" id="sales-drop">
+      <p style="margin:0 0 10px"><strong>Upload sales reports</strong></p>
+      <label class="btn primary" for="sales-files">Choose PDFs<input type="file" id="sales-files" accept=".pdf,application/pdf" multiple hidden></label>
+      <p class="muted" style="margin:10px 0 0;font-size:13px">Or drag them here. One report per site, listed by day. Choose as many sites as you like at once.</p>
+    </div>
+    <div id="sales-out" style="margin-top:16px"></div>
+    <div class="section">${headHtml('Sales by site', withData.length ? `${plural(withData.length, 'site')} with sales` : '')}
+      <div class="card">${rows ? `<ul class="rows">${rows}</ul>` : emptyHtml('No sites yet', '')}</div></div>
+    ${data.items.length ? `<div class="section">${headHtml('Idealpos items', 'Which grade each item’s sales count towards.', isAdmin() ? '<button class="btn" data-act="sales-items">Change</button>' : '')}
+      <div class="card"><ul class="rows">${links}</ul></div></div>` : ''}
+    <div class="note" style="margin-top:16px">Uploading the same days again replaces them. Days missing from a report are left out of the averages rather than counted as no sales, and today is skipped because it isn’t finished.</div>`;
+}
+
+function itemLinksDialog(items, grades, onSaved) {
+  const opts = (sel) => `<option value="">Not fuel – skip</option>${grades.map((g) => `<option value="${g.id}"${g.id === sel ? ' selected' : ''}>${esc(g.code)} – ${esc(g.name)}</option>`).join('')}`;
+  openDialog({
+    title: 'Idealpos items',
+    sub: 'Which grade each item’s sales count towards. Items linked to the same grade are added together.',
+    body: `<div class="grid">${items.map((i, k) => `<div class="field full"><label for="it_${k}">${esc(i.item_code)} ${esc(i.item_name || '')}</label><select id="it_${k}" data-item="${k}">${opts(i.grade_id)}</select></div>`).join('')}</div>`,
+    onSave: async () => {
+      const list = items.map((i, k) => ({ item_code: i.item_code, item_name: i.item_name, grade_id: $(`#it_${k}`).value ? Number($(`#it_${k}`).value) : null }));
+      await api('/sales/items', { method: 'PUT', body: { items: list } });
+      toast('Links saved');
+      if (onSaved) onSaved();
+    },
+  });
+}
+
+function wireSales() {
+  const drop = $('#sales-drop');
+  if (!drop) return;
+  const out = $('#sales-out');
+  let pending = null;
+
+  const showResults = (res) => {
+    const notes = (r) => [
+      r.missing.length ? `${plural(r.missing.length, 'day')} missing from the report (${esc(r.missing.map(fmtDayShort).join(', '))})` : '',
+      r.skipped_today ? 'today skipped' : '',
+      r.ignored.length ? `skipped ${esc(r.ignored.join(', '))}` : '',
+    ].filter(Boolean).join('; ');
+    out.innerHTML = `<div class="note good" style="margin-bottom:12px">Uploaded sales for ${plural(res.reports.length, 'site')}. <a href="#/board">See the run-out board</a></div>
+      <div class="card"><table class="summary"><thead><tr><th>Site</th><th>Days</th><th class="hide-sm">Notes</th></tr></thead><tbody>
+      ${res.reports.map((r) => `<tr><td><strong>${esc(r.site)}</strong><div class="muted" style="font-size:12px">${r.first ? `${esc(fmtDayShort(r.first))} – ${esc(fmtDayShort(r.last))}` : 'No days'}</div><div class="muted" style="font-size:12px;display:none" data-sm-notes>${notes(r)}</div></td>
+        <td class="n">${fmtN(r.days)}</td><td class="hide-sm muted" style="font-size:13px">${notes(r) || '—'}</td></tr>`).join('')}</tbody></table></div>`;
+    if (window.matchMedia('(max-width: 560px)').matches) $$('[data-sm-notes]').forEach((el) => { if (el.textContent) el.style.display = 'block'; });
+  };
+
+  const upload = async (btn) => {
+    if (btn) btn.disabled = true;
+    try {
+      // Check the links first, then send the reports a few at a time.
+      const outline = pending.reports.map((r) => ({ file: r.file, location: r.location, items: r.items.map((i) => ({ code: i.code, name: i.name })) }));
+      const check = await api('/sales/import', { method: 'POST', body: { reports: outline, check: true } });
+      if (check.errors.length) throw Object.assign(new Error('Nothing was uploaded.'), { data: { errors: check.errors } });
+      if (check.needs.locations.length || check.needs.items.length) return linkStep(check.needs);
+      const res = { reports: [] };
+      for (let i = 0; i < pending.reports.length; i += 4) {
+        out.innerHTML = `<div class="note">Uploading ${fmtN(Math.min(i + 4, pending.reports.length))} of ${plural(pending.reports.length, 'report')}\u2026</div>`;
+        const part = await api('/sales/import', { method: 'POST', body: { reports: pending.reports.slice(i, i + 4) } });
+        res.reports.push(...part.reports);
+      }
+      invalidate('sites');
+      state.salesResult = res;
+      toast('Sales uploaded');
+      render();
+    } catch (err) {
+      if (err.status === 409 && err.data && err.data.needs) return linkStep(err.data.needs);
+      const list = err.data && err.data.errors;
+      out.insertAdjacentHTML('afterbegin', `<div class="note bad" style="margin-bottom:12px">${list ? `Nothing was uploaded:<ul>${list.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>` : esc(err.message)}</div>`);
+      if (btn) btn.disabled = false;
+    }
+  };
+
+  // First upload from a location or with a new item: say which site and grade they are.
+  const linkStep = async (needs) => {
+    const [sites, grades] = await Promise.all([load('sites', true), load('grades', true)]);
+    if (!isAdmin()) {
+      out.innerHTML = `<div class="note warn">These need linking before the sales can go in, and only an admin can do that:<ul>
+        ${needs.locations.map((l) => `<li>Idealpos location ${esc(l.location)} (${esc(l.file)})</li>`).join('')}
+        ${needs.items.map((i) => `<li>Item ${esc(i.item_code)} ${esc(i.item_name)}</li>`).join('')}</ul></div>`;
+      return;
+    }
+    const free = sites.filter((s) => !s.sales_code);
+    const used = new Set();
+    const locRows = needs.locations.map((l, k) => {
+      const guess = guessSite(l.file, free.filter((s) => !used.has(s.id)));
+      if (guess) used.add(guess.id);
+      return `<div class="field"><label for="loc_${k}">Location ${esc(l.location)} <span class="muted" style="font-weight:400">${esc(l.file)}</span></label>
+        <select id="loc_${k}" data-loc="${esc(l.location)}"><option value="">Choose a site…</option>${free.map((s) => `<option value="${s.id}"${guess && guess.id === s.id ? ' selected' : ''}>${esc(s.name)}</option>`).join('')}</select></div>`;
+    }).join('');
+    const itemRows = needs.items.map((i, k) => {
+      const guess = guessGrade(i.item_name, grades);
+      return `<div class="field"><label for="itm_${k}">${esc(i.item_code)} ${esc(i.item_name)}</label>
+        <select id="itm_${k}" data-item="${esc(i.item_code)}" data-name="${esc(i.item_name)}"><option value="none"${guess === null ? ' selected' : ''}>Not fuel – skip</option>
+        ${grades.map((g) => `<option value="${g.id}"${guess && guess.id === g.id ? ' selected' : ''}>${esc(g.code)} – ${esc(g.name)}</option>`).join('')}
+        ${guess === undefined ? '<option value="" selected>Choose…</option>' : ''}</select></div>`;
+    }).join('');
+    out.innerHTML = `<div class="card pad">
+      <h2>Link these the first time</h2>
+      <p class="muted" style="margin:4px 0 14px">The app has filled in its best guesses. Check them; next time these reports upload without asking.</p>
+      ${locRows ? `<h3 style="font-size:14px;margin:0 0 8px">Idealpos locations → sites</h3><div class="grid">${locRows}</div>` : ''}
+      ${itemRows ? `<h3 style="font-size:14px;margin:16px 0 8px">Idealpos items → grades</h3><div class="grid">${itemRows}</div>` : ''}
+      <div class="err" id="link-err"></div>
+      <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap"><button class="btn primary" id="link-save">Save links and upload</button><button class="btn" id="link-cancel">Cancel</button></div>
+    </div>`;
+    $('#link-cancel').onclick = () => { out.innerHTML = ''; $('#sales-files').value = ''; };
+    $('#link-save').onclick = async (e) => {
+      const btn = e.target;
+      $('#link-err').textContent = '';
+      const locs = $$('[data-loc]', out).map((el) => ({ location: el.dataset.loc, site: Number(el.value) }));
+      const its = $$('[data-item]', out).map((el) => ({ item_code: el.dataset.item, item_name: el.dataset.name, value: el.value }));
+      const missingLoc = locs.find((l) => !l.site);
+      if (missingLoc) { $('#link-err').textContent = `Choose a site for location ${missingLoc.location}.`; return; }
+      const dupe = locs.find((l, i) => locs.findIndex((x) => x.site === l.site) !== i);
+      if (dupe) { $('#link-err').textContent = 'Two locations are linked to the same site.'; return; }
+      const missingItem = its.find((i) => i.value === '');
+      if (missingItem) { $('#link-err').textContent = `Choose a grade for ${missingItem.item_code} ${missingItem.item_name}, or mark it not fuel.`; return; }
+      btn.disabled = true;
+      try {
+        for (const l of locs) await api(`/sites/${l.site}`, { method: 'PUT', body: { sales_code: l.location } });
+        if (its.length) await api('/sales/items', { method: 'PUT', body: { items: its.map((i) => ({ item_code: i.item_code, item_name: i.item_name, grade_id: i.value === 'none' ? null : Number(i.value) })) } });
+        invalidate('sites');
+        await upload(null);
+      } catch (err) {
+        $('#link-err').textContent = err.message;
+        btn.disabled = false;
+      }
+    };
+  };
+
+  if (state.salesResult) {
+    showResults(state.salesResult);
+    state.salesResult = null;
+  }
+
+  const handle = async (files) => {
+    files = [...files].filter((f) => f);
+    if (!files.length) return;
+    out.innerHTML = `<div class="note">Reading ${plural(files.length, 'report')}…</div>`;
+    const reports = [];
+    const failed = [];
+    for (const f of files) {
+      try {
+        if (!/\.pdf$/i.test(f.name)) throw new Error('Choose PDF files.');
+        const r = await readIdealposTrend(await f.arrayBuffer());
+        reports.push({ file: f.name, ...r });
+      } catch (err) {
+        failed.push({ file: f.name, error: err.message });
+      }
+    }
+    pending = { reports };
+    const sameLoc = reports.filter((r, i) => reports.findIndex((x) => x.location === r.location) !== i);
+    out.innerHTML = `<div class="card"><table class="summary"><thead><tr><th>Report</th><th class="hide-sm">Location</th><th style="text-align:right">Days</th></tr></thead><tbody>
+      ${reports.map((r) => `<tr><td><strong>${esc(r.file)}</strong><div class="muted" style="font-size:12px">${esc(fmtDayShort(r.start))} – ${esc(fmtDayShort(r.end))} · ${plural(r.items.length, 'item')}${r.missing.length ? ` · ${plural(r.missing.length, 'day')} missing` : ''}</div></td>
+        <td class="hide-sm">${esc(r.location)}</td><td class="n">${fmtN(Object.keys(r.items[0] ? r.items[0].days : {}).length)}</td></tr>`).join('')}
+      ${failed.map((f) => `<tr><td><strong>${esc(f.file)}</strong><div style="color:var(--danger);font-size:13px">${esc(f.error)}</div></td><td class="hide-sm"></td><td class="n">—</td></tr>`).join('')}
+      </tbody></table>
+      ${sameLoc.length ? `<div class="note warn" style="margin:0 16px 12px">Several reports are for the same location. Where their days overlap, the later file wins.</div>` : ''}
+      <div style="padding:12px 16px;border-top:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap">
+        ${reports.length ? `<button class="btn primary" id="sales-go">Upload ${plural(reports.length, 'report')}</button>` : ''}<button class="btn" id="sales-cancel">Cancel</button>
+        ${failed.length ? `<span class="muted" style="align-self:center;font-size:13px">${plural(failed.length, 'file')} couldn’t be read and will be skipped.</span>` : ''}</div></div>`;
+    $('#sales-cancel').onclick = () => { out.innerHTML = ''; $('#sales-files').value = ''; };
+    if (reports.length) $('#sales-go').onclick = (e) => upload(e.target);
+  };
+  $('#sales-files').onchange = (e) => handle(e.target.files);
+  drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
+  drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+  drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); handle(e.dataTransfer.files); });
+}
+
 /* ----------------------------------------------------- auth screens */
 function authScreen(setup) {
   return `<div class="auth"><div class="card">${icon.logo}
@@ -1300,10 +2073,10 @@ async function render() {
       <button class="btn" data-act="logout">Sign out</button></div></div>`;
     return;
   }
-  const parts = (location.hash.replace(/^#\/?/, '') || 'sites').split('/');
+  const parts = (location.hash.replace(/^#\/?/, '') || 'board').split('/');
   const route = parts[0];
-  const views = { sites: viewSites, dips: viewDips, tanks: viewTanks, trucks: viewTrucks, grades: viewGrades, terminals: viewTerminals, drivers: viewDrivers, settings: viewSettings, import: viewImport, users: viewUsers };
-  const view = route === 'sites' && parts[1] ? () => viewSite(Number(parts[1])) : views[route] || viewSites;
+  const views = { board: viewBoard, sales: viewSales, sites: viewSites, dips: viewDips, tanks: viewTanks, trucks: viewTrucks, grades: viewGrades, terminals: viewTerminals, drivers: viewDrivers, settings: viewSettings, import: viewImport, users: viewUsers };
+  const view = route === 'sites' && parts[1] ? () => viewSite(Number(parts[1])) : views[route] || viewBoard;
   if (!$('#main')) app.innerHTML = shell(route, '');
   else $$('nav.tabs a').forEach((a) => a.classList.toggle('on', a.getAttribute('href') === '#/' + route));
   const main = $('#main');
@@ -1361,6 +2134,23 @@ function afterRender(route) {
     };
   }
   if (route === 'import') wireImport();
+  if (route === 'sales') wireSales();
+  if (route === 'board' && $('#bq')) {
+    const apply = () => {
+      const term = $('#bq').value.trim().toLowerCase();
+      const f = $('#bfilter').value;
+      $$('.board-site').forEach((c) => {
+        const st = c.dataset.status;
+        const show = (!term || c.dataset.name.includes(term)) &&
+          (!f || (f === 'due' && ['overdue', 'today', 'soon'].includes(st)) || (f === 'flags' && c.dataset.flags === '1'));
+        c.hidden = !show;
+      });
+      const unk = $('#board-unknown');
+      if (unk) unk.hidden = !$$('#board-unknown .board-site').some((c) => !c.hidden);
+    };
+    $('#bq').oninput = apply;
+    $('#bfilter').onchange = apply;
+  }
   if (route === 'dips' && $('#dq')) {
     const apply = () => {
       const term = $('#dq').value.trim().toLowerCase();
@@ -1375,7 +2165,7 @@ function afterRender(route) {
 }
 
 document.addEventListener('click', async (e) => {
-  const t = e.target.closest('[data-add],[data-edit],[data-edit-tank],[data-edit-site],[data-user],[data-add-user],[data-act],[data-dip-enter],[data-dip-upload],[data-dip-tank],#menu-btn');
+  const t = e.target.closest('[data-add],[data-edit],[data-edit-tank],[data-edit-site],[data-user],[data-add-user],[data-act],[data-dip-enter],[data-dip-upload],[data-dip-tank],[data-board-grade],#menu-btn');
   const menu = $('#menu');
   if (menu && !e.target.closest('#menu')) { menu.classList.remove('open'); $('#menu-btn').setAttribute('aria-expanded', 'false'); }
   if (!t) return;
@@ -1390,6 +2180,13 @@ document.addEventListener('click', async (e) => {
       state.settings = null;
       location.hash = '';
       render();
+    } else if (t.dataset.act === 'board-refresh') {
+      render();
+    } else if (t.dataset.act === 'sales-items') {
+      itemLinksDialog(state.salesData.items, await load('grades', true), () => render());
+    } else if (t.dataset.boardGrade) {
+      const [sid, gid] = t.dataset.boardGrade.split(':').map(Number);
+      boardGradeDialog(sid, gid);
     } else if (t.dataset.act === 'password') {
       menu.classList.remove('open');
       changePassword();
