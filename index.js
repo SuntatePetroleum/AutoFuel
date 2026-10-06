@@ -195,6 +195,24 @@ const MIGRATIONS = [
     )`,
     `CREATE INDEX IF NOT EXISTS idx_runs_company_date ON runs(company_id, run_date)`,
   ],
+  // v5: weight limits. Each compartment sits on the truck (0) or a trailer (1, 2); each
+  // part has a GVM and a tare, and the whole combination can have a GCM. Grade densities
+  // still at the original defaults move to the top of their usual range.
+  [
+    `ALTER TABLE compartments ADD COLUMN unit INTEGER NOT NULL DEFAULT 0`,
+    `ALTER TABLE trucks ADD COLUMN gvm_t REAL`,
+    `ALTER TABLE trucks ADD COLUMN tare_t REAL`,
+    `ALTER TABLE trucks ADD COLUMN trailer1_gvm_t REAL`,
+    `ALTER TABLE trucks ADD COLUMN trailer1_tare_t REAL`,
+    `ALTER TABLE trucks ADD COLUMN trailer2_gvm_t REAL`,
+    `ALTER TABLE trucks ADD COLUMN trailer2_tare_t REAL`,
+    `ALTER TABLE trucks ADD COLUMN gcm_t REAL`,
+    `ALTER TABLE settings ADD COLUMN mass_margin_kg INTEGER NOT NULL DEFAULT 0`,
+    `UPDATE grades SET density = 0.75 WHERE code = 'ULP91' AND density = 0.74`,
+    `UPDATE grades SET density = 0.76 WHERE code IN ('E10', 'ULP95') AND density = 0.75`,
+    `UPDATE grades SET density = 0.77 WHERE code = 'ULP98' AND density = 0.75`,
+    `UPDATE grades SET density = 0.85 WHERE code IN ('DSL', 'PDSL') AND density = 0.835`,
+  ],
 ];
 
 let schemaVersionSeen = 0;
@@ -365,6 +383,30 @@ function coerce(field, spec, raw) {
 
 const COMBINATIONS = ['Any', 'Rigid', 'Semi', 'B-double', 'Road train'];
 const TRUCK_CLASSES = ['Rigid', 'Semi', 'B-double', 'Road train'];
+// The parts of a combination that can carry fuel, with their weight columns.
+const WEIGHT_PARTS = [
+  ['gvm_t', 'tare_t', 'Truck'],
+  ['trailer1_gvm_t', 'trailer1_tare_t', 'Trailer 1'],
+  ['trailer2_gvm_t', 'trailer2_tare_t', 'Trailer 2'],
+];
+const UNIT_NAMES = WEIGHT_PARTS.map((p) => p[2]);
+const DEFAULT_DENSITY = 0.85;
+
+// Fuel weight a truck may carry: per part (GVM less tare) and for the whole combination
+// (GCM less every tare), less the company's margin, in kg. Infinity where nothing is set.
+function weightLimits(truck, unitsInUse, marginKg = 0) {
+  const parts = WEIGHT_PARTS.map(([gvm, tare]) =>
+    truck[gvm] != null && truck[tare] != null ? (truck[gvm] - truck[tare]) * 1000 - marginKg : Infinity);
+  let total = Infinity;
+  if (truck.gcm_t != null) {
+    // Every part that's fitted needs a tare: the truck always, a trailer if it carries fuel or has a GVM.
+    const fitted = WEIGHT_PARTS.filter(([gvm], i) => i === 0 || unitsInUse.has(i) || truck[gvm] != null);
+    if (fitted.every(([, tare]) => truck[tare] != null)) {
+      total = truck.gcm_t * 1000 - fitted.reduce((a, [, tare]) => a + truck[tare] * 1000, 0) - marginKg;
+    }
+  }
+  return { parts, total };
+}
 
 const ENTITIES = {
   grades: {
@@ -463,38 +505,59 @@ const ENTITIES = {
       depot: { type: 'text', label: 'Home depot' },
       combination_class: { type: 'text', options: TRUCK_CLASSES, label: 'Combination class' },
       max_payload_t: { type: 'num', min: 0, max: 200, label: 'Maximum payload' },
+      gvm_t: { type: 'num', min: 0, max: 200, label: 'Truck GVM' },
+      tare_t: { type: 'num', min: 0, max: 100, label: 'Truck tare' },
+      trailer1_gvm_t: { type: 'num', min: 0, max: 200, label: 'Trailer 1 GVM' },
+      trailer1_tare_t: { type: 'num', min: 0, max: 100, label: 'Trailer 1 tare' },
+      trailer2_gvm_t: { type: 'num', min: 0, max: 200, label: 'Trailer 2 GVM' },
+      trailer2_tare_t: { type: 'num', min: 0, max: 100, label: 'Trailer 2 tare' },
+      gcm_t: { type: 'num', min: 0, max: 300, label: 'GCM' },
       available: { type: 'bool', label: 'Available' },
     },
     list: 'SELECT * FROM trucks WHERE company_id = ? ORDER BY name',
+    async validate(env, companyId, id, values) {
+      for (const [gvm, tare, part] of WEIGHT_PARTS) {
+        if (values[gvm] != null && values[tare] != null && values[tare] >= values[gvm]) {
+          throw new HttpError(400, `The ${part.toLowerCase()} tare must be less than its GVM.`);
+        }
+      }
+    },
     async decorate(env, companyId, rows) {
       const { results } = await env.DB.prepare(
-        'SELECT truck_id, position, capacity_l FROM compartments WHERE company_id = ? ORDER BY truck_id, position'
+        'SELECT truck_id, position, capacity_l, unit FROM compartments WHERE company_id = ? ORDER BY truck_id, position'
       )
         .bind(companyId)
         .all();
       const byTruck = new Map();
       for (const c of results) {
         if (!byTruck.has(c.truck_id)) byTruck.set(c.truck_id, []);
-        byTruck.get(c.truck_id).push(c.capacity_l);
+        byTruck.get(c.truck_id).push(c);
       }
       for (const r of rows) {
-        r.compartments = byTruck.get(r.id) || [];
+        const list = byTruck.get(r.id) || [];
+        r.compartments = list.map((c) => c.capacity_l);
+        r.compartment_units = list.map((c) => c.unit || 0);
         r.total_capacity_l = r.compartments.reduce((a, b) => a + b, 0);
       }
       return rows;
     },
-    // Compartments are saved with their truck, as a list of litres in position order.
+    // Compartments are saved with their truck, as a list of litres in position order, with
+    // a matching list saying which part each is on (0 truck, 1 trailer 1, 2 trailer 2).
     async afterSave(env, companyId, id, body) {
       if (!Array.isArray(body.compartments)) return;
       if (body.compartments.length > 20) throw new HttpError(400, 'A truck can have at most 20 compartments.');
       const caps = body.compartments.map((v, i) => coerce('compartment', {
         type: 'int', required: true, min: 1, max: 60000, label: `Compartment ${i + 1}`,
       }, v));
+      const unitsIn = Array.isArray(body.compartment_units) ? body.compartment_units : [];
+      const units = caps.map((_, i) => coerce('unit', {
+        type: 'int', min: 0, max: 2, label: `Compartment ${i + 1}’s trailer`,
+      }, unitsIn[i]) || 0);
       const stmts = [env.DB.prepare('DELETE FROM compartments WHERE truck_id = ? AND company_id = ?').bind(id, companyId)];
       caps.forEach((cap, i) => {
         stmts.push(
-          env.DB.prepare('INSERT INTO compartments (company_id, truck_id, position, capacity_l) VALUES (?, ?, ?, ?)')
-            .bind(companyId, id, i + 1, cap)
+          env.DB.prepare('INSERT INTO compartments (company_id, truck_id, position, capacity_l, unit) VALUES (?, ?, ?, ?, ?)')
+            .bind(companyId, id, i + 1, cap, units[i])
         );
       });
       await env.DB.batch(stmts);
@@ -637,6 +700,7 @@ const SETTINGS_FIELDS = {
   holiday_region: { type: 'text', options: ['ACT', 'NSW', 'NT', 'QLD', 'SA', 'TAS', 'VIC', 'WA', 'None'], label: 'Public holiday calendar' },
   timezone: { type: 'text', max: 60, label: 'Time zone' },
   dip_stale_hours: { type: 'num', min: 1, max: 720, label: 'Dip out of date after' },
+  mass_margin_kg: { type: 'int', min: 0, max: 5000, label: 'Weight margin' },
 };
 
 async function getSettings(env, companyId) {
@@ -710,13 +774,15 @@ function cleanPassword(raw) {
   return pw;
 }
 
+// Densities in kg/L at 15 °C, at the top of each grade's usual range so weights err on the
+// heavy side. Diesel's 0.85 is the legal maximum in Australia.
 const DEFAULT_GRADES = [
-  ['ULP91', 'Unleaded 91', 0.74, 1],
-  ['E10', 'E10', 0.75, 2],
-  ['ULP95', 'Premium unleaded 95', 0.75, 3],
-  ['ULP98', 'Premium unleaded 98', 0.75, 4],
-  ['DSL', 'Diesel', 0.835, 5],
-  ['PDSL', 'Premium diesel', 0.835, 6],
+  ['ULP91', 'Unleaded 91', 0.75, 1],
+  ['E10', 'E10', 0.76, 2],
+  ['ULP95', 'Premium unleaded 95', 0.76, 3],
+  ['ULP98', 'Premium unleaded 98', 0.77, 4],
+  ['DSL', 'Diesel', 0.85, 5],
+  ['PDSL', 'Premium diesel', 0.85, 6],
 ];
 
 async function firstRunSetup(request, env) {
@@ -916,12 +982,18 @@ async function importSetup(request, env, me) {
     truck: { type: 'text', required: true, label: 'Truck' },
     position: { type: 'int', required: true, min: 1, max: 20, label: 'Compartment' },
     capacity_l: { type: 'int', required: true, min: 1, max: 60000, label: 'Capacity' },
+    unit: { type: 'text', max: 20, label: 'On' },
   };
 
   const grades = clean('Grades', rowsOf('grades'), gradeFields, 'code');
   const sites = clean('Sites', rowsOf('sites'), siteFields, 'name');
   const tanks = clean('Tanks', rowsOf('tanks'), tankFields, (v) => `${v.site}\u0000${v.name}`);
   const trucks = clean('Trucks', rowsOf('trucks'), truckFields, 'name');
+  for (const t of trucks) {
+    for (const [gvm, tare, part] of WEIGHT_PARTS) {
+      if (t[gvm] != null && t[tare] != null && t[tare] >= t[gvm]) errors.push(`Trucks: "${t.name}" ${part.toLowerCase()} tare must be less than its GVM.`);
+    }
+  }
   const comps = clean('Compartments', rowsOf('compartments'), compFields, (v) => `${v.truck}\u0000${v.position}`);
 
   // Cross-checks: every tank's site and grade, every compartment's truck, must exist after import.
@@ -934,6 +1006,11 @@ async function importSetup(request, env, me) {
   }
   for (const c of comps) {
     if (!truckNames.has(c.truck)) errors.push(`Compartments: truck "${c.truck}" isn't on the Trucks tab or in the app.`);
+    // Which part it's on: Truck, Trailer 1 or Trailer 2 (blank means the truck).
+    const on = String(c.unit || 'Truck').trim().toLowerCase().replace(/\s+/g, ' ');
+    const unit = { truck: 0, 'prime mover': 0, trailer: 1, 'trailer 1': 1, 'lead trailer': 1, dog: 1, 'trailer 2': 2, 'rear trailer': 2 }[on];
+    if (unit === undefined) errors.push(`Compartments: truck "${c.truck}" compartment ${c.position} is on "${c.unit}". Use Truck, Trailer 1 or Trailer 2.`);
+    c.unit = unit || 0;
   }
   const compsByTruck = new Map();
   for (const c of comps) {
@@ -999,8 +1076,8 @@ async function importSetup(request, env, me) {
     for (const c of list) {
       stmts.push(
         env.DB.prepare(
-          `INSERT INTO compartments (company_id, truck_id, position, capacity_l) VALUES (?, ${truckId.sql}, ?, ?)`
-        ).bind(cid, ...truckId.params, c.position, c.capacity_l)
+          `INSERT INTO compartments (company_id, truck_id, position, capacity_l, unit) VALUES (?, ${truckId.sql}, ?, ?, ?)`
+        ).bind(cid, ...truckId.params, c.position, c.capacity_l, c.unit)
       );
     }
   }
@@ -1660,7 +1737,7 @@ async function saveRun(request, env, me) {
   const runDate = String(body.run_date || '');
   if (!DAY_RE.test(runDate)) throw new HttpError(400, 'Choose the day of the run.');
   const truckId = coerce('truck', { type: 'ref', required: true, label: 'Truck' }, body.truck_id);
-  const truck = await env.DB.prepare('SELECT id, name, rego FROM trucks WHERE id = ? AND company_id = ?').bind(truckId, cid).first();
+  const truck = await env.DB.prepare('SELECT * FROM trucks WHERE id = ? AND company_id = ?').bind(truckId, cid).first();
   if (!truck) throw new HttpError(400, 'That truck was not found.');
   let driver = null;
   if (body.driver_id != null && body.driver_id !== '') {
@@ -1672,11 +1749,12 @@ async function saveRun(request, env, me) {
   const stopsIn = Array.isArray(plan.stops) ? plan.stops : [];
   if (!stopsIn.length || stopsIn.length > 3) throw new HttpError(400, 'A run needs one to three stops.');
   const { results: siteRows } = await env.DB.prepare('SELECT id, name FROM sites WHERE company_id = ?').bind(cid).all();
-  const { results: gradeRows } = await env.DB.prepare('SELECT id, code FROM grades WHERE company_id = ?').bind(cid).all();
-  const { results: compRows } = await env.DB.prepare('SELECT position, capacity_l FROM compartments WHERE truck_id = ? AND company_id = ?').bind(truckId, cid).all();
+  const { results: gradeRows } = await env.DB.prepare('SELECT id, code, density FROM grades WHERE company_id = ?').bind(cid).all();
+  const { results: compRows } = await env.DB.prepare('SELECT position, capacity_l, unit FROM compartments WHERE truck_id = ? AND company_id = ?').bind(truckId, cid).all();
   const sitesById = new Map(siteRows.map((r) => [r.id, r]));
   const gradesById = new Map(gradeRows.map((r) => [r.id, r]));
   const compByPos = new Map(compRows.map((r) => [r.position, r.capacity_l]));
+  const unitByPos = new Map(compRows.map((r) => [r.position, r.unit || 0]));
   const stops = stopsIn.map((st, i) => {
     const site = sitesById.get(Number(st.site_id));
     if (!site) throw new HttpError(400, `Stop ${i + 1}: that site was not found.`);
@@ -1695,10 +1773,26 @@ async function saveRun(request, env, me) {
     if (!grade) throw new HttpError(400, `Compartment ${position}: that grade was not found.`);
     const litres = Math.round(Number(c.litres));
     if (!(litres > 0) || litres > cap) throw new HttpError(400, `Compartment ${position} holds at most ${cap.toLocaleString('en-AU')} L.`);
-    return { position, capacity: cap, litres, stop, site_id: stops[stop].site_id, grade_id: grade.id, grade_code: grade.code };
+    const unit = unitByPos.get(position);
+    const kg = Math.round(litres * (grade.density || DEFAULT_DENSITY));
+    return { position, capacity: cap, litres, unit, kg, stop, site_id: stops[stop].site_id, grade_id: grade.id, grade_code: grade.code };
   });
   if (!comps.length) throw new HttpError(400, 'Put fuel in at least one compartment.');
   if (new Set(comps.map((c) => c.position)).size !== comps.length) throw new HttpError(400, 'A compartment appears twice.');
+  // Never over a weight limit: each part's GVM, and the GCM for the whole combination.
+  const settings = await getSettings(env, cid);
+  const limits = weightLimits(truck, new Set(compRows.map((r) => r.unit || 0)), settings.mass_margin_kg || 0);
+  const kgOn = [0, 1, 2].map((u) => comps.filter((c) => c.unit === u).reduce((a, c) => a + c.kg, 0));
+  const tonnes = (kg) => (kg / 1000).toLocaleString('en-AU', { maximumFractionDigits: 1 });
+  kgOn.forEach((kg, u) => {
+    if (kg > limits.parts[u] + 0.5) {
+      throw new HttpError(400, `This load puts ${tonnes(kg)} t of fuel on ${truck.name}’s ${UNIT_NAMES[u].toLowerCase()}, which can carry ${tonnes(limits.parts[u])} t. Work out the loads again.`);
+    }
+  });
+  const kgAll = kgOn.reduce((a, b) => a + b, 0);
+  if (kgAll > limits.total + 0.5) {
+    throw new HttpError(400, `This load is ${tonnes(kgAll)} t of fuel, over the ${tonnes(limits.total)} t ${truck.name} can carry under its GCM. Work out the loads again.`);
+  }
   comps.sort((a, b) => a.position - b.position);
   const stored = JSON.stringify({ truck_name: truck.name, truck_rego: truck.rego, driver_name: driver ? driver.name : null, stops, compartments: comps });
   const now = Date.now();

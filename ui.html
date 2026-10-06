@@ -136,6 +136,9 @@
   .plan-table tr.over td { color: var(--danger); }
   .plan-table td { white-space: nowrap; vertical-align: top; }
   .plan-table .sub { display: block; font-size: 11px; color: var(--muted); }
+  .run-weight { display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 0 16px 12px; font-size: 13px; color: var(--muted); }
+  .run-weight strong { color: var(--text); }
+  .run-comp.part span { color: var(--warn); }
   .run-comps { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px 10px; padding: 12px 16px; border-top: 1px solid var(--border); }
   .run-comp { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
   .run-comp b { color: var(--text); margin-right: 4px; }
@@ -177,7 +180,13 @@
   .comp-edit { display: grid; gap: 8px; }
   .comp-line { display: flex; gap: 8px; align-items: center; }
   .comp-line b { width: 32px; color: var(--muted); font-weight: 600; font-size: 13px; }
-  .comp-line input { flex: 1; }
+  .comp-line input { flex: 1; min-width: 0; }
+  .comp-line select { width: auto; flex: none; }
+  .comp-unit { font-size: 11px; color: var(--muted); align-self: center; margin-left: 4px; text-transform: uppercase; letter-spacing: .04em; }
+  .comp-unit:first-child { margin-left: 0; }
+  .weights td, .weights th { padding: 6px 6px; }
+  .weights input { width: 100%; min-width: 64px; max-width: 110px; }
+  .weights td.n { white-space: nowrap; }
 
   .auth { max-width: 400px; margin: 8vh auto; padding: 0 16px; }
   .auth .card { padding: 24px; }
@@ -345,13 +354,12 @@ const FORMS = {
     { k: 'rego', label: 'Rego' },
     { k: 'depot', label: 'Home depot' },
     { k: 'combination_class', label: 'Combination class', type: 'select', options: CLASSES, blank: 'Not set' },
-    { k: 'max_payload_t', label: 'Maximum payload', type: 'number', step: 'any', suffix: 't', hint: 'Used for the weight check' },
     { k: 'available', label: 'Available', type: 'bool', def: 1 },
   ],
   grades: [
     { k: 'code', label: 'Code', required: true, hint: 'Shown on load sheets, like ULP91' },
     { k: 'name', label: 'Name', required: true },
-    { k: 'density', label: 'Density', type: 'number', step: 'any', suffix: 'kg/L', hint: 'For the truck weight check' },
+    { k: 'density', label: 'Density', type: 'number', step: 'any', suffix: 'kg/L', hint: 'At 15 °C. Use the highest figure on your terminal’s load sheets so loads stay under weight.' },
     { k: 'sort_order', label: 'Order', type: 'number', step: 1, hint: 'Lower numbers list first' },
   ],
   terminals: [
@@ -377,6 +385,63 @@ const FORMS = {
   ],
 };
 const NOUN = { sites: 'site', tanks: 'tank', trucks: 'truck', grades: 'grade', terminals: 'terminal', drivers: 'driver' };
+
+/* ------------------------------------------------------------ weights */
+// The parts of a combination that carry fuel, and their weight fields (tonnes).
+const UNIT_NAMES = ['Truck', 'Trailer 1', 'Trailer 2'];
+const WEIGHT_PARTS = [['gvm_t', 'tare_t'], ['trailer1_gvm_t', 'trailer1_tare_t'], ['trailer2_gvm_t', 'trailer2_tare_t']];
+const DEFAULT_DENSITY = 0.85;
+const fmtTonnes = (kg) => (kg / 1000).toLocaleString('en-AU', { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + ' t';
+const unitsOf = (truck) => (truck.compartment_units || []).length === truck.compartments.length ? truck.compartment_units : truck.compartments.map(() => 0);
+
+// Fuel weight a truck may carry, in kg: per part (GVM less tare) and for the whole
+// combination (GCM less every tare), less the company's margin. Infinity where not set.
+// The server runs the same check when a run is confirmed.
+function weightLimits(truck, unitsInUse, marginKg = 0) {
+  const parts = WEIGHT_PARTS.map(([gvm, tare]) =>
+    truck[gvm] != null && truck[tare] != null ? (truck[gvm] - truck[tare]) * 1000 - marginKg : Infinity);
+  let total = Infinity;
+  let missingTare = false;
+  if (truck.gcm_t != null) {
+    const fitted = WEIGHT_PARTS.filter(([gvm], i) => i === 0 || unitsInUse.has(i) || truck[gvm] != null);
+    if (fitted.every(([, tare]) => truck[tare] != null)) {
+      total = truck.gcm_t * 1000 - fitted.reduce((a, [, tare]) => a + truck[tare] * 1000, 0) - marginKg;
+    } else missingTare = true;
+  }
+  return { parts, total, missingTare, any: parts.some(Number.isFinite) || Number.isFinite(total) };
+}
+const truckLimits = (truck) => weightLimits(truck, new Set(unitsOf(truck)), (state.settings && state.settings.mass_margin_kg) || 0);
+
+function weightsEditor(t) {
+  const dis = isAdmin() ? '' : ' disabled';
+  const inp = (k, label, ph = '') => `<input type="number" inputmode="decimal" step="any" min="0" data-w="${k}" value="${esc(t[k])}" placeholder="${ph}" aria-label="${esc(label)}"${dis}>`;
+  const rows = WEIGHT_PARTS.map(([gvm, tare], u) => `<tr><td>${UNIT_NAMES[u]}</td><td>${inp(gvm, UNIT_NAMES[u] + ' GVM in tonnes')}</td>
+    <td>${inp(tare, UNIT_NAMES[u] + ' tare in tonnes')}</td><td class="n num" data-carry="${u}"></td></tr>`).join('');
+  return `<div class="section" style="margin-top:18px">
+    <div class="head" style="margin-bottom:4px"><h2>Weights</h2></div>
+    <p class="muted" style="font-size:13px;margin:0 0 10px">In tonnes, from the registration papers. Put a trailer’s ATM in its GVM. “Can carry” is the fuel each part can take: its GVM less its tare, and for the whole combination the GCM less all the tares. Leave a part blank if it isn’t fitted.</p>
+    <table class="summary weights"><thead><tr><th></th><th>GVM</th><th>Tare</th><th class="n">Can carry</th></tr></thead><tbody>${rows}
+      <tr><td>Whole combination</td><td>${inp('gcm_t', 'GCM in tonnes', 'GCM')}</td><td class="muted" style="font-size:12px">All tares</td><td class="n num" data-carry="total"></td></tr>
+    </tbody></table></div>`;
+}
+function readWeights(root) {
+  const out = {};
+  for (const el of $$('[data-w]', root)) out[el.dataset.w] = el.value === '' ? null : Number(el.value);
+  return out;
+}
+function wireWeights(form) {
+  const update = () => {
+    const t = readWeights(form);
+    const units = new Set($$('.comp-line select', form).map((x) => Number(x.value)));
+    const lim = weightLimits(t, units, (state.settings && state.settings.mass_margin_kg) || 0);
+    const show = (kg) => (!Number.isFinite(kg) ? '—' : kg <= 0 ? 'Check tare' : fmtTonnes(kg));
+    lim.parts.forEach((kg, u) => { $(`[data-carry="${u}"]`, form).textContent = show(kg); });
+    $('[data-carry="total"]', form).textContent = lim.missingTare ? 'Needs every tare' : show(lim.total);
+  };
+  form.addEventListener('input', update);
+  form.addEventListener('change', update);
+  update();
+}
 
 /* ----------------------------------------------------------- dialogs */
 function fieldHtml(f, value, lists) {
@@ -483,7 +548,7 @@ async function editEntity(name, row, preset = {}) {
   for (const f of fields) if (f.type === 'ref') lists[f.ref] = await load(f.ref);
   const data = { ...preset, ...(row || {}) };
   const isNew = !row;
-  const extra = name === 'trucks' ? compartmentsEditor(data.compartments || []) : '';
+  const extra = name === 'trucks' ? weightsEditor(data) + compartmentsEditor(data.compartments || [], data.compartment_units || []) : '';
   const tankNote = name === 'tanks' && state.settings
     ? `<div class="note full" style="grid-column:1/-1">Fills to ${Math.round(state.settings.safe_fill_pct * 100)}% of capacity. The lowest level is worked out from this tank’s sales.</div>` : '';
   openDialog({
@@ -492,7 +557,11 @@ async function editEntity(name, row, preset = {}) {
     body: `<div class="grid">${fields.map((f) => fieldHtml(f, data[f.k], lists)).join('')}${tankNote}</div>${extra}`,
     onSave: async (form) => {
       const body = readFields(form, fields);
-      if (name === 'trucks') body.compartments = $$('.comp-line input', form).map((i) => (i.value === '' ? null : Number(i.value)));
+      if (name === 'trucks') {
+        body.compartments = $$('.comp-line input', form).map((i) => (i.value === '' ? null : Number(i.value)));
+        body.compartment_units = $$('.comp-line select', form).map((x) => Number(x.value));
+        Object.assign(body, readWeights(form));
+      }
       const missing = fields.find((f) => f.required && (body[f.k] == null || body[f.k] === ''));
       if (missing) throw new Error(`${missing.label} is required.`);
       if (isNew) await api('/' + name, { method: 'POST', body });
@@ -510,17 +579,20 @@ async function editEntity(name, row, preset = {}) {
     },
     deleteLabel: name === 'sites' ? 'Delete site and its tanks' : 'Delete',
   });
-  if (name === 'trucks') wireCompartments();
+  if (name === 'trucks') { wireCompartments(); wireWeights($('#dlg form')); }
 }
 const cap = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
-function compartmentsEditor(list) {
-  const line = (v, i) => `<div class="comp-line"><b>C${i + 1}</b><input type="number" inputmode="numeric" step="1" min="1" value="${esc(v)}" aria-label="Compartment ${i + 1} litres"${isAdmin() ? '' : ' disabled'}><span class="muted">L</span>${isAdmin() ? `<button type="button" class="btn sm ghost" data-rm aria-label="Remove compartment ${i + 1}">Remove</button>` : ''}</div>`;
+function compartmentsEditor(list, units) {
+  const dis = isAdmin() ? '' : ' disabled';
+  const line = (v, i, u) => `<div class="comp-line"><b>C${i + 1}</b><input type="number" inputmode="numeric" step="1" min="1" value="${esc(v)}" aria-label="Compartment ${i + 1} litres"${dis}><span class="muted">L</span>
+    <select aria-label="Compartment ${i + 1} is on"${dis}>${UNIT_NAMES.map((n, k) => `<option value="${k}"${k === (u || 0) ? ' selected' : ''}>${n}</option>`).join('')}</select>${isAdmin() ? `<button type="button" class="btn sm ghost" data-rm aria-label="Remove compartment ${i + 1}">Remove</button>` : ''}</div>`;
   return `<div class="section" style="margin-top:18px">
-    <div class="head" style="margin-bottom:8px"><h2>Compartments</h2><span class="spacer"></span><span class="muted num" id="comp-total"></span></div>
-    <div class="comp-edit" id="comp-list">${list.map(line).join('')}</div>
+    <div class="head" style="margin-bottom:4px"><h2>Compartments</h2><span class="spacer"></span><span class="muted num" id="comp-total"></span></div>
+    <p class="muted" style="font-size:13px;margin:0 0 10px">Set which part each compartment is on, so its fuel counts against the right GVM.<span id="comp-split"></span></p>
+    <div class="comp-edit" id="comp-list">${list.map((v, i) => line(v, i, units[i])).join('')}</div>
     ${isAdmin() ? '<button type="button" class="btn sm" id="comp-add" style="margin-top:10px">Add compartment</button>' : ''}
-    <template id="comp-tpl">${line('', 0)}</template>
+    <template id="comp-tpl">${line('', 0, 0)}</template>
   </div>`;
 }
 function wireCompartments() {
@@ -529,12 +601,19 @@ function wireCompartments() {
     $$('.comp-line', list).forEach((l, i) => { $('b', l).textContent = 'C' + (i + 1); });
     const total = $$('input', list).reduce((a, i) => a + (Number(i.value) || 0), 0);
     $('#comp-total').textContent = `${plural($$('.comp-line', list).length, 'compartment')} · ${fmtL(total)}`;
+    const byUnit = UNIT_NAMES.map(() => 0);
+    $$('.comp-line', list).forEach((l) => { byUnit[Number($('select', l).value)] += Number($('input', l).value) || 0; });
+    const parts = byUnit.map((l, u) => (l ? `${UNIT_NAMES[u]} ${fmtL(l)}` : '')).filter(Boolean);
+    $('#comp-split').textContent = parts.length > 1 ? ` ${parts.join(' · ')}.` : '';
   };
+  list.addEventListener('change', renumber);
   list.addEventListener('input', renumber);
   list.addEventListener('click', (e) => { if (e.target.matches('[data-rm]')) { e.target.closest('.comp-line').remove(); renumber(); } });
   const add = $('#comp-add');
   if (add) add.onclick = () => {
+    const last = $$('.comp-line select', list).pop();
     list.insertAdjacentHTML('beforeend', $('#comp-tpl').innerHTML);
+    if (last) $$('.comp-line select', list).pop().value = last.value;
     renumber();
     $$('input', list).pop().focus();
   };
@@ -641,13 +720,28 @@ async function viewTanks() {
       : `<div class="card">${emptyHtml('No tanks yet', 'Add them from a site’s page, or load them all from the Import screen.')}</div>`);
 }
 
+function weightSummary(t) {
+  const bits = WEIGHT_PARTS.map(([gvm], u) => (t[gvm] != null ? `${UNIT_NAMES[u]} GVM ${fmtN(t[gvm])} t` : '')).filter(Boolean);
+  if (t.gcm_t != null) bits.push(`GCM ${fmtN(t.gcm_t)} t`);
+  if (!bits.length) return '<span style="color:var(--warn)">No weight limits set</span>';
+  const lim = truckLimits(t);
+  const carry = Math.min(lim.total, lim.parts.reduce((a, kg, u) => a + (unitsOf(t).includes(u) ? kg : 0), 0));
+  return esc(bits.join(' · ')) + (Number.isFinite(carry) ? ` · carries up to ${fmtTonnes(carry)} of fuel` : '');
+}
+function compChips(t) {
+  const units = unitsOf(t);
+  const split = new Set(units).size > 1;
+  return t.compartments.map((c, i) => `${split && (i === 0 || units[i] !== units[i - 1]) ? `<span class="comp-unit">${UNIT_NAMES[units[i]]}</span>` : ''}<span class="comp"><b>C${i + 1}</b>${fmtN(c)}</span>`).join('');
+}
+
 async function viewTrucks() {
   const trucks = await load('trucks');
   const cards = trucks.map((t) => `
     <li><button class="row" data-edit="trucks" data-id="${t.id}" style="align-items:flex-start">
       <div class="main"><div class="title">${esc(t.name)} ${t.available ? '<span class="badge ok">Available</span>' : '<span class="badge off">Not available</span>'}</div>
-        <div class="meta">${esc([t.rego, t.depot, t.combination_class, t.max_payload_t != null ? t.max_payload_t + ' t payload' : null].filter(Boolean).join(' · '))}</div>
-        <div class="comps">${t.compartments.map((c, i) => `<span class="comp"><b>C${i + 1}</b>${fmtN(c)}</span>`).join('') || '<span class="faint" style="font-size:13px">No compartments</span>'}</div></div>
+        <div class="meta">${esc([t.rego, t.depot, t.combination_class].filter(Boolean).join(' · '))}</div>
+        <div class="meta">${weightSummary(t)}</div>
+        <div class="comps">${compChips(t) || '<span class="faint" style="font-size:13px">No compartments</span>'}</div></div>
       <div class="side"><strong class="num">${fmtL(t.total_capacity_l)}</strong><br>${plural(t.compartments.length, 'comp.', 'comps.')}</div>${icon.chev}</button></li>`).join('');
   const avail = trucks.filter((t) => t.available);
   return headHtml('Trucks', `${plural(trucks.length, 'truck')} · ${fmtN(avail.length)} available · ${fmtL(avail.reduce((a, t) => a + t.total_capacity_l, 0))} available capacity`, addBtn('trucks', 'Add truck')) +
@@ -659,9 +753,9 @@ async function viewGrades() {
   const rows = grades.map((g) => `
     <li><button class="row" data-edit="grades" data-id="${g.id}">
       <div class="main"><div class="title"><span class="chip">${esc(g.code)}</span> ${esc(g.name)}</div>
-        <div class="meta">${g.density != null ? g.density + ' kg/L' : 'Density not set'}</div></div>
+        <div class="meta">${g.density != null ? g.density + ' kg/L at 15 °C' : `<span style="color:var(--warn)">Density not set, so ${DEFAULT_DENSITY} kg/L is used</span>`}</div></div>
       <div class="side">${plural(g.tank_count, 'tank')}</div>${icon.chev}</button></li>`).join('');
-  return headHtml('Grades', 'The fuels your sites sell. Density is only used for the truck weight check.', addBtn('grades', 'Add grade')) +
+  return headHtml('Grades', 'The fuels your sites sell. Density sets how heavy each load is, so trucks stay within their weight limits.', addBtn('grades', 'Add grade')) +
     `<div class="card">${grades.length ? `<ul class="rows">${rows}</ul>` : emptyHtml('No grades yet', '')}</div>`;
 }
 
@@ -705,6 +799,7 @@ const SETTINGS = [
   ['Delivery planning', [
     { k: 'runout_buffer_h', label: 'Extra margin', suffix: 'hours', step: 'any', hint: 'Brings every deliver-by time forward by this many hours. 0 means deliver by the time a tank reaches its lowest level.' },
     { k: 'min_drop_l', label: 'Minimum worthwhile drop', suffix: 'L', step: 1, hint: 'A site’s delivery window opens once its tanks together have room for this much.' },
+    { k: 'mass_margin_kg', label: 'Keep loads under each weight limit by', suffix: 'kg', step: 1, hint: 'Room for a heavier batch of fuel than the grade’s density. 0 plans right up to the limit.' },
     { k: 'whole_compartments', label: 'Drop whole compartments only, so nothing comes back on the truck', type: 'bool' },
   ]],
   ['Forecast', [
@@ -916,8 +1011,10 @@ const SHEETS = {
     'calibration chart on file': 'calibration_on_file' } },
   Trucks: { key: 'trucks', cols: {
     'truck': 'name', 'rego': 'rego', 'home depot': 'depot', 'available': 'available', 'available in admin system': 'available',
-    'combination class': 'combination_class', 'maximum payload (t)': 'max_payload_t' } },
-  Compartments: { key: 'compartments', cols: { 'truck': 'truck', 'compartment': 'position', 'capacity (l)': 'capacity_l' } },
+    'combination class': 'combination_class', 'maximum payload (t)': 'max_payload_t',
+    'truck gvm (t)': 'gvm_t', 'truck tare (t)': 'tare_t', 'trailer 1 gvm (t)': 'trailer1_gvm_t', 'trailer 1 tare (t)': 'trailer1_tare_t',
+    'trailer 2 gvm (t)': 'trailer2_gvm_t', 'trailer 2 tare (t)': 'trailer2_tare_t', 'gcm (t)': 'gcm_t' } },
+  Compartments: { key: 'compartments', cols: { 'truck': 'truck', 'compartment': 'position', 'capacity (l)': 'capacity_l', 'on': 'unit', 'unit': 'unit' } },
 };
 const TIME_FIELDS = new Set(['delivery_from', 'delivery_until']);
 const TEXT_FIELDS = new Set(['postcode', 'external_id', 'sales_code', 'contact_phone', 'code', 'tank_number', 'rego']);
@@ -2198,24 +2295,29 @@ function wireSales() {
 
 /* ------------------------------------------------------ load optimiser */
 // Works out which grade goes in each compartment of one truck, for one or two stops.
-// Whole compartments only; each grade's total stays within the room its tanks will have
-// at arrival. Priorities, in order:
+// Whole compartments, except that one compartment on a part can be short-filled to keep
+// that part within its weight limit. Each grade's total stays within the room its tanks
+// will have at arrival. Priorities, in order:
 //   1. The first stop's grades with the fewest hours of cover get fuel first (covers are
 //      compared from the lowest up, capped at PLAN_CAP_H, so a grade with plenty of fuel
 //      doesn't compete with one about to run low).
-//   2. The same for the second stop, with the compartments the first stop doesn't need.
+//   2. The same for the second stop, with the compartments and weight the first stop leaves.
 //   3. The most litres on the truck.
 //   4. Longer cover overall.
 const PLAN_CAP_H = 72;
 
-// Compartments grouped by size: identical compartments are interchangeable.
+// Compartments grouped by the part they're on and their size: identical compartments on
+// the same part are interchangeable.
 function compartmentClasses(comps) {
-  const bySize = new Map();
+  const byKey = new Map();
   for (const c of comps) {
-    if (!bySize.has(c.capacity)) bySize.set(c.capacity, []);
-    bySize.get(c.capacity).push(c.position);
+    const unit = c.unit || 0;
+    const key = `${unit}:${c.capacity}`;
+    if (!byKey.has(key)) byKey.set(key, { size: c.capacity, unit, positions: [] });
+    byKey.get(key).positions.push(c.position);
   }
-  return [...bySize].sort((a, b) => b[0] - a[0]).map(([size, positions]) => ({ size, positions: positions.sort((a, b) => a - b) }));
+  return [...byKey.values()].sort((a, b) => b.size - a.size || a.unit - b.unit)
+    .map((c) => ({ ...c, positions: c.positions.sort((x, y) => x - y) }));
 }
 
 // Calls back with every way to share `counts[i]` compartments of each class between the
@@ -2260,64 +2362,131 @@ function compareVectors(a, b) {
   return 0;
 }
 
-const massOf = (grades, litres) => grades.reduce((m, g, j) => m + litres[j] * (g.density || 0.8), 0);
+const densityOf = (g) => g.density || DEFAULT_DENSITY;
+const sum3 = (kg) => kg[0] + kg[1] + kg[2];
+
+// Holds fuel back so a load stays within its weight limits. `buckets` are
+// { unit, size, n, j }: n compartments of one size on one part, all carrying grade j;
+// `lim` is { parts: [kg per part], total } (Infinity where there's no limit), or null.
+// Fuel comes off the grade that will have the most hours of cover (the denser one if
+// tied), a compartment at a time, in 100 L lots. Returns litres held back per bucket,
+// litres per grade after that, and the load's weight on each part.
+function trimToLimits(buckets, grades, litres, lim) {
+  const kg = [0, 0, 0];
+  for (const b of buckets) kg[b.unit] += b.n * b.size * densityOf(grades[b.j]);
+  const cut = buckets.map(() => 0);
+  if (!lim) return { cut, kg, litres };
+  let out = litres;
+  const shave = (onPart, over) => {
+    while (over > 1e-6) {
+      let pick = -1;
+      let pickCover = -Infinity;
+      let pickDensity = 0;
+      buckets.forEach((b, k) => {
+        if (!onPart(b.unit) || b.n * b.size - cut[k] <= 0) return;
+        const g = grades[b.j];
+        const cover = coverHours(g, out[b.j]);
+        const d = densityOf(g);
+        if (cover > pickCover || (cover === pickCover && d > pickDensity)) { pick = k; pickCover = cover; pickDensity = d; }
+      });
+      if (pick < 0) return;
+      const b = buckets[pick];
+      const left = b.n * b.size - cut[pick];
+      const inCompartment = left - (Math.ceil(left / b.size) - 1) * b.size;
+      const take = Math.min(inCompartment, Math.ceil(over / pickDensity / 100) * 100);
+      if (out === litres) out = litres.slice();
+      cut[pick] += take;
+      out[b.j] -= take;
+      kg[b.unit] -= take * pickDensity;
+      over -= take * pickDensity;
+    }
+  };
+  for (let u = 0; u < 3; u++) if (kg[u] > lim.parts[u]) shave((x) => x === u, kg[u] - lim.parts[u]);
+  if (sum3(kg) > lim.total) shave(() => true, sum3(kg) - lim.total);
+  return { cut, kg, litres: out };
+}
+
+// One stop's load from a class allocation: litres per grade and weight per part, after
+// any fuel is held back for the weight limits.
+function weighLoad(classes, alloc, grades, litres, lim) {
+  if (!lim) return { litres, kg: null };
+  const kg = [0, 0, 0];
+  for (let i = 0; i < classes.length; i++) {
+    for (let j = 0; j < grades.length; j++) if (alloc[i][j]) kg[classes[i].unit] += alloc[i][j] * classes[i].size * densityOf(grades[j]);
+  }
+  if (kg.every((m, u) => m <= lim.parts[u]) && sum3(kg) <= lim.total) return { litres, kg };
+  const buckets = [];
+  for (let i = 0; i < classes.length; i++) {
+    for (let j = 0; j < grades.length; j++) if (alloc[i][j]) buckets.push({ unit: classes[i].unit, size: classes[i].size, n: alloc[i][j], j });
+  }
+  const t = trimToLimits(buckets, grades, litres, lim);
+  return { litres: t.litres, kg: t.kg };
+}
 
 // Best load for one stop from the compartments in `counts`. Returns its score and litres per grade.
-function bestForStop(classes, counts, stop, maxMass) {
+function bestForStop(classes, counts, stop, lim) {
   const rooms = stop.grades.map((g) => Math.max(0, g.room));
   let best = null;
-  eachAllocation(classes, counts, rooms, (alloc, litres) => {
-    if (maxMass != null && massOf(stop.grades, litres) > maxMass) return;
+  eachAllocation(classes, counts, rooms, (alloc, full) => {
+    const { litres, kg } = weighLoad(classes, alloc, stop.grades, full, lim);
     const total = litres.reduce((a, b) => a + b, 0);
     const cand = { capped: coverVector(stop.grades, litres, true), total, full: coverVector(stop.grades, litres, false) };
     if (!best || compareVectors(cand.capped, best.capped) > 0 ||
         (compareVectors(cand.capped, best.capped) === 0 && (cand.total > best.total ||
           (cand.total === best.total && compareVectors(cand.full, best.full) > 0)))) {
-      best = { ...cand, litres: litres.slice(), alloc: alloc.map((r) => r.slice()) };
+      best = { ...cand, litres: litres.slice(), alloc: alloc.map((r) => r.slice()), kg };
     }
   });
   return best;
 }
 
-// Plans one truck for one or two stops. `stops[i].grades` are
-// { grade_id, code, room, level, floor, rateH, density }.
-function planTruck(comps, stops, maxMassKg) {
+// Plans one truck for one or two stops. `comps` are { position, capacity, unit };
+// `stops[i].grades` are { grade_id, code, room, level, floor, rateH, density }; `limits` is
+// { parts, total } in kg of fuel, or null. Returns the compartments used, with their stop
+// and grade; litres per compartment are worked out from that by applyWeights.
+function planTruck(comps, stops, limits) {
+  const lim = limits && (limits.parts.some(Number.isFinite) || Number.isFinite(limits.total)) ? limits : null;
   const classes = compartmentClasses(comps);
   const all = classes.map((c) => c.positions.length);
   const A = stops[0];
   const B = stops[1];
   let pick;
   if (!B) {
-    pick = { a: bestForStop(classes, all, A, maxMassKg), b: null, rest: null };
+    pick = { a: bestForStop(classes, all, A, lim), b: null };
   } else {
     // Every first-stop load that's as good as possible for the first stop, grouped by the
-    // compartments it leaves free; the second stop then gets the best of what's left.
+    // compartments it leaves free. Within a group, a load is dropped only if another one
+    // covers as well, carries as much and weighs no more on every part; the second stop
+    // then gets the best of what each leaves.
     let bestCapped = null;
     const byRest = new Map();
     const roomsA = A.grades.map((g) => Math.max(0, g.room));
-    eachAllocation(classes, all, roomsA, (alloc, litres) => {
-      if (maxMassKg != null && massOf(A.grades, litres) > maxMassKg) return;
+    const beats = (x, y) => compareVectors(x.full, y.full) >= 0 && x.total >= y.total && (!lim || x.kg.every((m, u) => m <= y.kg[u] + 1e-6));
+    eachAllocation(classes, all, roomsA, (alloc, full) => {
+      const { litres, kg } = weighLoad(classes, alloc, A.grades, full, lim);
       const capped = coverVector(A.grades, litres, true);
       const cmp = bestCapped ? compareVectors(capped, bestCapped) : 1;
       if (cmp < 0) return;
       if (cmp > 0) { bestCapped = capped; byRest.clear(); }
       const rest = all.map((n, i) => n - alloc[i].reduce((a, b) => a + b, 0));
       const key = rest.join(',');
-      const full = coverVector(A.grades, litres, false);
-      const prev = byRest.get(key);
-      if (!prev || compareVectors(full, prev.full) > 0) {
-        byRest.set(key, { capped, full, total: litres.reduce((a, b) => a + b, 0), litres: litres.slice(), alloc: alloc.map((r) => r.slice()), rest });
-      }
+      const cand = { capped, full: coverVector(A.grades, litres, false), total: litres.reduce((a, b) => a + b, 0), kg };
+      const list = byRest.get(key) || [];
+      if (list.some((x) => beats(x, cand))) return;
+      byRest.set(key, [...list.filter((x) => !beats(cand, x)), { ...cand, litres: litres.slice(), alloc: alloc.map((r) => r.slice()), rest }]);
     });
-    for (const a of byRest.values()) {
-      const b = bestForStop(classes, a.rest, B, maxMassKg != null ? maxMassKg - massOf(A.grades, a.litres) : null);
-      const cand = { a, b, rest: a.rest };
-      if (!pick) { pick = cand; continue; }
-      const c1 = compareVectors(b.capped, pick.b.capped);
-      const t1 = a.total + b.total;
-      const t0 = pick.a.total + pick.b.total;
-      if (c1 > 0 || (c1 === 0 && (t1 > t0 || (t1 === t0 && (compareVectors(a.full, pick.a.full) > 0 ||
-          (compareVectors(a.full, pick.a.full) === 0 && compareVectors(b.full, pick.b.full) > 0)))))) pick = cand;
+    for (const list of byRest.values()) {
+      for (const a of list) {
+        const limB = lim && { parts: lim.parts.map((p, u) => p - a.kg[u]), total: lim.total - sum3(a.kg) };
+        const b = bestForStop(classes, a.rest, B, limB);
+        const cand = { a, b };
+        if (!pick) { pick = cand; continue; }
+        const c1 = compareVectors(b.capped, pick.b.capped);
+        const t1 = a.total + b.total;
+        const t0 = pick.a.total + pick.b.total;
+        if (c1 > 0 || (c1 === 0 && (t1 > t0 || (t1 === t0 && (compareVectors(a.full, pick.a.full) > 0 ||
+            (compareVectors(a.full, pick.a.full) === 0 && compareVectors(b.full, pick.b.full) > 0)))))) pick = cand;
+      }
     }
   }
   // Turn class counts back into compartment numbers: bigger compartments first, in order.
@@ -2328,7 +2497,7 @@ function planTruck(comps, stops, maxMassKg) {
     classes.forEach((c, i) => {
       stop.grades.forEach((g, j) => {
         for (let k = 0; k < res.alloc[i][j]; k++) {
-          out.push({ position: c.positions[used[i]], capacity: c.size, stop: stopIndex, grade_id: g.grade_id });
+          out.push({ position: c.positions[used[i]], capacity: c.size, unit: c.unit, stop: stopIndex, grade_id: g.grade_id });
           used[i]++;
         }
       });
@@ -2407,7 +2576,7 @@ function stopNeeds(siteId, at) {
     const level = Math.max(0, g.level - soldBetweenC(g, b.now, Math.max(b.now, at)));
     grades.push({
       grade_id: g.grade_id, code: g.grade_code, group: g, level, floor: g.floor, fill_to: g.fill_to, capacity: g.capacity,
-      room: Math.max(0, Math.floor(g.fill_to - level)), rateH: g.avg_daily / 24, density: density.get(g.grade_id) || 0.8,
+      room: Math.max(0, Math.floor(g.fill_to - level)), rateH: g.avg_daily / 24, density: density.get(g.grade_id) || DEFAULT_DENSITY,
     });
   }
   return { site: s, grades, skipped };
@@ -2433,13 +2602,46 @@ function optimiseDraft(d) {
   const truck = (state.cache.trucks || []).find((t) => t.id === d.truck_id);
   if (!truck) { d.comps = []; return; }
   const needs = d.stops.map((st) => stopNeeds(st.site_id, st.at));
-  const maxMass = truck.max_payload_t ? truck.max_payload_t * 1000 : null;
-  const plan = planTruck(truck.compartments.map((c, i) => ({ position: i + 1, capacity: c })), needs.map((n) => ({ grades: n.grades })), maxMass);
+  const units = unitsOf(truck);
+  const lim = truckLimits(truck);
+  const plan = planTruck(truck.compartments.map((c, i) => ({ position: i + 1, capacity: c, unit: units[i] })), needs.map((n) => ({ grades: n.grades })), lim.any ? lim : null);
   d.comps = truck.compartments.map((c, i) => {
     const hit = plan.find((p) => p.position === i + 1);
-    return { position: i + 1, capacity: c, target: hit ? { stop: hit.stop, grade_id: hit.grade_id } : null };
+    return { position: i + 1, capacity: c, unit: units[i], litres: 0, target: hit ? { stop: hit.stop, grade_id: hit.grade_id } : null };
   });
   d.manual = false;
+  applyWeights(d);
+}
+
+// Litres in each compartment of a draft: full, except where fuel has to be held back to
+// keep the truck within its weight limits. The first stop's load is weighed first, then the
+// second stop gets what's left. Also records the fuel weight on each part (d.kg).
+function applyWeights(d) {
+  const truck = (state.cache.trucks || []).find((t) => t.id === d.truck_id);
+  const gradeInfo = new Map((state.cache.grades || []).map((g) => [g.id, g]));
+  const limits = truck ? truckLimits(truck) : null;
+  const lim = limits && limits.any ? { parts: limits.parts.slice(), total: limits.total } : null;
+  d.kg = [0, 0, 0];
+  for (const c of d.comps) c.litres = c.target ? c.capacity : 0;
+  d.stops.forEach((st, i) => {
+    const grades = stopNeeds(st.site_id, st.at).grades.slice();
+    const index = new Map(grades.map((g, j) => [g.grade_id, j]));
+    // Same order as the optimiser: bigger compartments first, then the truck before trailers.
+    const comps = d.comps.filter((c) => c.target && c.target.stop === i)
+      .sort((x, y) => y.capacity - x.capacity || (x.unit || 0) - (y.unit || 0) || y.position - x.position);
+    for (const c of comps) {
+      if (index.has(c.target.grade_id)) continue;
+      const g = gradeInfo.get(c.target.grade_id) || {};
+      index.set(c.target.grade_id, grades.length);
+      grades.push({ grade_id: c.target.grade_id, level: 0, floor: 0, rateH: 0, density: g.density || DEFAULT_DENSITY });
+    }
+    const buckets = comps.map((c) => ({ unit: c.unit || 0, size: c.capacity, n: 1, j: index.get(c.target.grade_id), c }));
+    const litres = grades.map((g, j) => buckets.reduce((a, b) => a + (b.j === j ? b.size : 0), 0));
+    const t = trimToLimits(buckets, grades, litres, lim);
+    buckets.forEach((b, k) => { b.c.litres = b.size - t.cut[k]; });
+    t.kg.forEach((m, u) => { d.kg[u] += m; if (lim) lim.parts[u] -= m; });
+    if (lim) lim.total -= sum3(t.kg);
+  });
 }
 
 let draftSeq = 0;
@@ -2449,7 +2651,7 @@ function newDraft(truckId, stops) {
   return d;
 }
 
-const litresTo = (d, stop, gradeId) => d.comps.filter((c) => c.target && c.target.stop === stop && c.target.grade_id === gradeId).reduce((a, c) => a + c.capacity, 0);
+const litresTo = (d, stop, gradeId) => d.comps.filter((c) => c.target && c.target.stop === stop && c.target.grade_id === gradeId).reduce((a, c) => a + c.litres, 0);
 
 // Suggests a run for each free truck: the most urgent site first, then a second stop
 // nearby with whatever compartments are left.
@@ -2493,7 +2695,12 @@ function suggestRuns() {
     let draft = best.d;
     // A second stop, if enough of the truck is left for a worthwhile drop.
     const spare = best.t.total_capacity_l - best.sc.total;
-    if (spare >= minDrop) {
+    // Weight left for a second stop, if the truck has limits.
+    const lim = truckLimits(best.t);
+    const kg = best.d.kg || [0, 0, 0];
+    const kgLeft = !lim.any ? Infinity : Math.min(lim.total - sum3(kg),
+      [0, 1, 2].reduce((a, u) => a + (unitsOf(best.t).includes(u) ? Math.max(0, lim.parts[u] - kg[u]) : 0), 0));
+    if (spare >= minDrop && kgLeft >= minDrop * 0.7) {
       const here = sitesById.get(s.id);
       const candidates = [...needy, ...extras].filter((x) => !used.has(x.id) && siteAllows(sitesById.get(x.id), best.t))
         .map((x) => ({ x, km: kmBetween(here, sitesById.get(x.id)) }))
@@ -2535,13 +2742,39 @@ function planWarnings(d) {
       else if (!x && g.level <= g.floor) out.push(`${n.site.name} ${g.code} will be at or below its lowest level and gets nothing on this run.`);
     }
   });
-  if (truck && truck.max_payload_t) {
-    const density = new Map((state.cache.grades || []).map((g) => [g.id, g.density || 0.8]));
-    const kg = d.comps.reduce((a, c) => a + (c.target ? c.capacity * (density.get(c.target.grade_id) || 0.8) : 0), 0);
-    if (kg > truck.max_payload_t * 1000) out.push(`About ${fmtN(Math.round(kg / 100) / 10)} t of fuel, over ${truck.name}’s ${fmtN(truck.max_payload_t)} t payload.`);
+  if (truck) {
+    const lim = truckLimits(truck);
+    const kg = d.kg || [0, 0, 0];
+    if (!lim.any) out.push(`${truck.name} has no weight limits set, so this load isn’t checked against its GVM. Add them on the Trucks screen.`);
+    WEIGHT_PARTS.forEach(([gvm, tare], u) => {
+      if (truck[gvm] != null && truck[tare] == null) out.push(`${truck.name}’s ${UNIT_NAMES[u].toLowerCase()} GVM can’t be checked until its tare is set.`);
+      if (kg[u] > lim.parts[u] + 0.5) out.push(`Over weight: ${fmtTonnes(kg[u])} of fuel on the ${UNIT_NAMES[u].toLowerCase()}, which can carry ${fmtTonnes(lim.parts[u])}.`);
+    });
+    if (lim.missingTare) out.push(`${truck.name}’s GCM can’t be checked until every part has a tare.`);
+    if (sum3(kg) > lim.total + 0.5) out.push(`Over weight: ${fmtTonnes(sum3(kg))} of fuel, more than the ${fmtTonnes(lim.total)} its GCM allows.`);
+    const used = new Set(d.comps.filter((c) => c.target && c.litres > 0).map((c) => c.target.grade_id));
+    for (const g of state.cache.grades || []) if (used.has(g.id) && g.density == null) out.push(`${g.code} has no density set, so ${DEFAULT_DENSITY} kg/L is assumed.`);
   }
   return out;
 }
+
+// Gross weight of each part against its limit, for the run card and load sheet.
+function weightParts(truck, kg) {
+  if (!truck) return [];
+  const lim = truckLimits(truck);
+  const units = unitsOf(truck);
+  const out = [];
+  WEIGHT_PARTS.forEach(([gvm, tare], u) => {
+    if (!Number.isFinite(lim.parts[u]) || !units.includes(u)) return;
+    out.push({ label: UNIT_NAMES[u], gross: truck[tare] * 1000 + kg[u], limit: truck[gvm] * 1000, kind: 'GVM' });
+  });
+  if (Number.isFinite(lim.total)) {
+    const margin = (state.settings && state.settings.mass_margin_kg) || 0;
+    out.push({ label: 'Combination', gross: truck.gcm_t * 1000 - margin - lim.total + sum3(kg), limit: truck.gcm_t * 1000, kind: 'GCM' });
+  }
+  return out;
+}
+const tonnes2 = (kg) => (kg / 1000).toLocaleString('en-AU', { minimumFractionDigits: 2, maximumFractionDigits: 2 }) + ' t';
 
 function stopSummaryHtml(d, i) {
   const st = d.stops[i];
@@ -2583,8 +2816,10 @@ function draftHtml(d) {
     });
     return opts.join('');
   };
-  const total = d.comps.reduce((a, c) => a + (c.target ? c.capacity : 0), 0);
+  const total = d.comps.reduce((a, c) => a + (c.target ? c.litres : 0), 0);
   const warns = planWarnings(d);
+  const split = truck && new Set(unitsOf(truck)).size > 1;
+  const weights = weightParts(truck, d.kg || [0, 0, 0]);
   const stopRow = (i) => {
     const st = d.stops[i];
     return `<div class="run-stop">
@@ -2601,8 +2836,9 @@ function draftHtml(d) {
       <button class="btn sm ghost" data-act="draft-remove">Remove</button>
     </div>
     ${stopRow(0)}${stopRow(1)}
-    <div class="run-comps">${d.comps.map((c) => `<label class="run-comp${c.target ? '' : ' empty'}"><span><b>C${c.position}</b> ${fmtN(c.capacity)} L</span>
+    <div class="run-comps">${d.comps.map((c) => `<label class="run-comp${c.target ? '' : ' empty'}${c.target && c.litres < c.capacity ? ' part' : ''}"><span><b>C${c.position}</b> ${c.target && c.litres < c.capacity ? `${fmtN(c.litres)} of ${fmtN(c.capacity)} L` : `${fmtN(c.capacity)} L`}${split ? ` · ${UNIT_NAMES[c.unit || 0]}` : ''}</span>
       <select data-f="comp" data-pos="${c.position}">${optionsFor(c)}</select></label>`).join('') || '<span class="muted">This truck has no compartments set up.</span>'}</div>
+    ${weights.length ? `<div class="run-weight">${weights.map((w) => `<span>${esc(w.label)} <strong class="num">${tonnes2(w.gross)}</strong> of ${tonnes2(w.limit)} ${w.kind}</span>`).join('')}${d.comps.some((c) => c.target && c.litres < c.capacity) ? '<span class="muted">Short-filled to stay within the limits</span>' : ''}</div>` : ''}
     ${warns.length ? `<ul class="bs-warn" style="margin:0">${warns.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}
     <div class="run-foot">
       <button class="btn primary" data-act="draft-confirm"${total ? '' : ' disabled'}>Confirm run</button>
@@ -2623,8 +2859,10 @@ function loadSheetText(run) {
   const p = run.plan;
   const day = new Intl.DateTimeFormat('en-AU', { timeZone: 'UTC', weekday: 'short', day: 'numeric', month: 'short' }).format(new Date(run.run_date + 'T00:00:00Z'));
   const lines = [`${p.truck_name}${p.truck_rego ? ` (${p.truck_rego})` : ''} · ${day}${p.driver_name ? ` · ${p.driver_name}` : ''}`, '', 'LOAD'];
-  for (const c of p.compartments) lines.push(`C${c.position}  ${fmtN(c.litres)} L  ${c.grade_code} → ${p.stops[c.stop].site_name}`);
+  for (const c of p.compartments) lines.push(`C${c.position}  ${fmtN(c.litres)} L  ${c.grade_code} → ${p.stops[c.stop].site_name}${c.litres < c.capacity ? `  (part fill, holds ${fmtN(c.capacity)} L)` : ''}`);
   lines.push(`Total ${fmtN(p.compartments.reduce((a, c) => a + c.litres, 0))} L`);
+  const weights = runWeights(run);
+  if (weights.length) lines.push(`Weight: ${weights.map((w) => `${w.label.toLowerCase()} ${tonnes2(w.gross)} of ${tonnes2(w.limit)} ${w.kind}`).join(', ')}`);
   p.stops.forEach((st, i) => {
     lines.push('', `DROP ${i + 1}: ${st.site_name}, about ${fmtTime(st.at)}`);
     const byGrade = new Map();
@@ -2643,6 +2881,15 @@ function loadSheetText(run) {
   return lines.join('\n');
 }
 
+// A saved run's weight on each part: from the weights stored when it was confirmed.
+function runWeights(run) {
+  const truck = (state.cache.trucks || []).find((t) => t.id === run.truck_id);
+  const gradeInfo = new Map((state.cache.grades || []).map((g) => [g.id, g]));
+  const kg = [0, 0, 0];
+  for (const c of run.plan.compartments) kg[c.unit || 0] += c.kg != null ? c.kg : c.litres * ((gradeInfo.get(c.grade_id) || {}).density || DEFAULT_DENSITY);
+  return weightParts(truck, kg);
+}
+
 function draftToRun(d) {
   const truck = (state.cache.trucks || []).find((t) => t.id === d.truck_id);
   const grades = new Map((state.cache.grades || []).map((g) => [g.id, g.code]));
@@ -2653,7 +2900,7 @@ function draftToRun(d) {
     plan: {
       truck_name: truck ? truck.name : '', truck_rego: truck ? truck.rego : '',
       stops: d.stops.map((st) => ({ site_id: st.site_id, at: st.at, site_name: siteName(st.site_id) })),
-      compartments: d.comps.filter((c) => c.target).map((c) => ({ position: c.position, capacity: c.capacity, litres: c.capacity, stop: c.target.stop, grade_id: c.target.grade_id, grade_code: grades.get(c.target.grade_id) })),
+      compartments: d.comps.filter((c) => c.target && c.litres > 0).map((c) => ({ position: c.position, capacity: c.capacity, litres: c.litres, unit: c.unit || 0, stop: c.target.stop, grade_id: c.target.grade_id, grade_code: grades.get(c.target.grade_id) })),
     },
   };
 }
@@ -2676,7 +2923,8 @@ function runCardHtml(r) {
       <span class="muted num">${fmtL(total)}</span><span class="spacer"></span>
       <button class="btn sm ghost danger" data-act="run-delete">Delete</button></div>
     ${p.stops.map((st, i) => `<div class="run-stop"><span class="run-num">${i + 1}</span><strong>${esc(st.site_name)}</strong><span class="muted">about ${esc(fmtTime(st.at))}</span></div>
-      <div class="run-comps" style="padding-top:0">${p.compartments.filter((c) => c.stop === i).map((c) => `<span class="comp"><b>C${c.position}</b>${esc(c.grade_code)} ${fmtN(c.litres)}</span>`).join('')}</div>`).join('')}
+      <div class="run-comps" style="padding-top:0">${p.compartments.filter((c) => c.stop === i).map((c) => `<span class="comp"><b>C${c.position}</b>${esc(c.grade_code)} ${fmtN(c.litres)}${c.litres < c.capacity ? ' (part)' : ''}</span>`).join('')}</div>`).join('')}
+    ${(() => { const w = runWeights(r); return w.length ? `<div class="run-weight">${w.map((x) => `<span>${esc(x.label)} <strong class="num">${tonnes2(x.gross)}</strong> of ${tonnes2(x.limit)} ${x.kind}</span>`).join('')}</div>` : ''; })()}
     <div class="run-foot"><button class="btn" data-act="run-sheet">Copy load sheet</button>
       ${r.status === 'done' ? '<button class="btn ghost" data-act="run-undone">Mark not done</button>' : '<button class="btn ghost" data-act="run-done">Mark done</button>'}</div>
   </div>`;
@@ -2722,7 +2970,7 @@ async function viewPlan() {
     `<div id="plan-root">
       ${runs.length ? `<div class="section" style="margin-top:0">${headHtml('Confirmed runs', '')}<div style="display:grid;gap:16px">${runs.map(runCardHtml).join('')}</div></div>` : ''}
       <div id="plan-drafts" class="section"></div>
-      ${!runs.length && !(state.planDrafts || []).length ? `<div class="card" id="plan-empty">${emptyHtml('No runs yet', 'Suggest runs fills each available truck, most urgent sites first. Loads use whole compartments and stay within the room each tank will have when the truck arrives.')}</div>` : ''}
+      ${!runs.length && !(state.planDrafts || []).length ? `<div class="card" id="plan-empty">${emptyHtml('No runs yet', 'Suggest runs fills each available truck, most urgent sites first. Loads use whole compartments and stay within the room each tank will have when the truck arrives. A compartment is only short-filled when that keeps the truck within its weight limits.')}</div>` : ''}
       <div id="plan-left"></div>
     </div>
     <p class="muted" style="font-size:13px;margin-top:16px">Arrival times are estimates you can change. A second stop is added when there’s room left on the truck for at least ${fmtL(state.settings.min_drop_l)} at a site within 120 km. Travel between stops is estimated from straight-line distance.</p>`;
@@ -2762,6 +3010,7 @@ function wirePlan() {
       const c = d.comps.find((x) => x.position === Number(el.dataset.pos));
       c.target = el.value ? { stop: Number(el.value.split(':')[0]), grade_id: Number(el.value.split(':')[1]) } : null;
       d.manual = true;
+      applyWeights(d);
     }
     rerender();
   });
@@ -2774,9 +3023,9 @@ function wirePlan() {
         const d = draftOf(btn);
         if (act === 'draft-remove') state.planDrafts.splice(state.planDrafts.indexOf(d), 1);
         if (act === 'draft-reset') optimiseDraft(d);
-        if (act === 'draft-sheet') return copyText(loadSheetText({ run_date: state.board.today, plan: draftToRun(d).plan }));
+        if (act === 'draft-sheet') return copyText(loadSheetText({ run_date: state.board.today, truck_id: d.truck_id, plan: draftToRun(d).plan }));
         if (act === 'draft-confirm') {
-          const warns = planWarnings(d).filter((w) => /won’t fit|over .* payload/.test(w));
+          const warns = planWarnings(d).filter((w) => /won’t fit|^Over weight/.test(w));
           if (warns.length && btn.dataset.confirm !== '1') {
             btn.dataset.confirm = '1';
             btn.textContent = 'Confirm anyway';
