@@ -301,7 +301,7 @@ const FORMS = {
     { k: 'drop_minutes', label: 'Average drop time', type: 'number', step: 1, suffix: 'min' },
     { k: 'contact_name', label: 'Site contact' },
     { k: 'contact_phone', label: 'Contact phone' },
-    { k: 'sales_code', label: 'Idealpos location', hint: 'The location number on this site’s sales reports. Set automatically on the first upload.' },
+    { k: 'sales_code', label: 'Sales location', hint: 'This site’s location number or name on its sales reports. Set automatically on the first upload.' },
     { k: 'active', label: 'Active', type: 'bool', def: 1 },
   ],
   tanks: [
@@ -590,7 +590,7 @@ async function viewSite(id) {
     `<div class="card pad"><dl class="details" style="margin:0">
       ${d('Site code', esc(s.code))}${d('Address', esc([s.address, s.postcode].filter(Boolean).join(' ')))}${d('Map', map)}
       ${d('Deliveries', deliveryText(s))}${d('Largest combination', esc(s.max_combination || 'Any'))}${d('Average drop time', s.drop_minutes != null ? s.drop_minutes + ' min' : '')}
-      ${d('Site contact', esc([s.contact_name, s.contact_phone].filter(Boolean).join(' · ')))}${d('Idealpos location', esc(s.sales_code))}${d('Price board site ID', esc(s.external_id))}
+      ${d('Site contact', esc([s.contact_name, s.contact_phone].filter(Boolean).join(' · ')))}${d('Sales location', esc(s.sales_code))}${d('Price board site ID', esc(s.external_id))}
     </dl></div>
     <div class="section">${headHtml('Tanks', mine.length ? `${plural(mine.length, 'tank')} · ${fmtL(mine.reduce((a, t) => a + t.capacity_l, 0))}` : '',
       (mine.some((t) => t.active) && canDip() ? `<button class="btn" data-dip-enter="${s.id}">Enter dips</button>` : '') +
@@ -1650,6 +1650,99 @@ async function readIdealposTrend(buffer) {
   return { location: scope[1], start, end, missing, items: items.map(({ code, name, days: d }) => ({ code, name, days: d })) };
 }
 
+/* ----------------------------------------- EMC ezi-manager fuel sales */
+// Reads an EMC ezi-manager "Fuel Sales Report" exported to Excel: one or more sites, each
+// a list of rows (date sold, tank number, grade description, litres sold). Returns one
+// report per site, in the same shape as an Idealpos report. Within a site, a grade with
+// no row on a day the site traded counts as no sales that day; days with no rows at all
+// for the site are listed as missing.
+const EMC_MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+
+function emcDay(v) {
+  if (typeof v === 'number' && v > 20000 && v < 80000) return excelSerialToLocal(v).slice(0, 10);
+  const m = String(v == null ? '' : v).trim().match(/^(?:[A-Za-z]+ )?(\d{1,2})[ -]([A-Za-z]{3})[a-z]*[ -](\d{4})$/);
+  if (!m || !EMC_MONTHS[m[2].toLowerCase()]) return null;
+  return isoDay(+m[3], EMC_MONTHS[m[2].toLowerCase()], +m[1]);
+}
+
+function readEmcFuelSales(sheets) {
+  const clean = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
+  for (const rows of Object.values(sheets)) {
+    if (!rows || !rows.some((r) => r && r.some((c) => clean(c) === 'Fuel Sales Report'))) continue;
+    // Column positions come from the header row.
+    const headRow = rows.find((r) => r && r.some((c) => clean(c).toLowerCase() === 'date sold'));
+    if (!headRow) throw new Error('Couldn’t find the Date Sold column in this Fuel Sales Report.');
+    const col = (name) => headRow.findIndex((c) => clean(c).toLowerCase() === name);
+    const cDate = col('date sold');
+    const cTank = col('tank number');
+    const cGrade = col('grade description');
+    const cLitres = col('litres sold');
+    if ([cDate, cGrade, cLitres].some((c) => c < 0)) throw new Error('This Fuel Sales Report is missing the Grade Description or Litres Sold column.');
+    let range = null;
+    for (const r of rows) {
+      const hit = r && r.map(clean).find((c) => /\d{4} to [A-Za-z]+ \d/.test(c));
+      if (hit) {
+        const m = hit.match(/(\d{1,2} [A-Za-z]{3} \d{4}) to (?:[A-Za-z]+ )?(\d{1,2} [A-Za-z]{3} \d{4})/);
+        if (m) range = { start: emcDay(m[1]), end: emcDay(m[2]) };
+        break;
+      }
+    }
+    const sites = new Map();
+    let site = null;
+    const errors = [];
+    rows.forEach((r, i) => {
+      if (!r) return;
+      const filled = r.map((c, j) => [j, c]).filter(([, c]) => clean(c) !== '');
+      if (!filled.length) return;
+      const day = emcDay(r[cDate]);
+      if (day) {
+        if (!site) { errors.push(`Row ${i + 1} comes before any site name.`); return; }
+        const grade = clean(r[cGrade]);
+        const litres = typeof r[cLitres] === 'number' ? r[cLitres] : Number(clean(r[cLitres]).replace(/,/g, ''));
+        if (!grade || !Number.isFinite(litres)) { errors.push(`Row ${i + 1} has no grade or litres.`); return; }
+        const tank = cTank >= 0 ? clean(r[cTank]) : '';
+        const s = sites.get(site);
+        s.days.add(day);
+        if (!s.items.has(grade)) s.items.set(grade, { days: {}, tanks: new Set(), seen: new Set(), tankDays: {} });
+        const it = s.items.get(grade);
+        const key = `${day}|${tank}`;
+        if (it.seen.has(key)) { errors.push(`Row ${i + 1} repeats ${grade}, tank ${tank} on ${day}.`); return; }
+        it.seen.add(key);
+        it.days[day] = (it.days[day] || 0) + litres;
+        if (tank) {
+          it.tanks.add(tank);
+          (it.tankDays[tank] = it.tankDays[tank] || []).push(day);
+        }
+        return;
+      }
+      // A site heading is a row with only a name in the first column.
+      const text = clean(r[filled[0][0]]);
+      if (filled.length === 1 && filled[0][0] === cDate && !/ezi-manager|fuel sales report|page \d/i.test(text)) {
+        site = text;
+        if (!sites.has(site)) sites.set(site, { days: new Set(), items: new Map() });
+      }
+    });
+    if (errors.length) throw new Error(`This Fuel Sales Report couldn’t be read: ${errors.slice(0, 3).join(' ')}`);
+    if (!sites.size) throw new Error('No sites were found in this Fuel Sales Report.');
+    const reports = [];
+    for (const [name, s] of sites) {
+      const days = [...s.days].sort();
+      const start = range && range.start ? range.start : days[0];
+      const end = range && range.end ? range.end : days[days.length - 1];
+      const missing = [];
+      for (let d = start; d <= end; d = addDays(d, 1)) if (!s.days.has(d)) missing.push(d);
+      const items = [...s.items].map(([grade, it]) => {
+        const full = {};
+        for (const d of days) full[d] = Math.round((it.days[d] || 0) * 1000) / 1000;
+        return { code: grade, name: grade, days: full, tankDays: it.tankDays, tanks: [...it.tanks].sort((a, b) => a.localeCompare(b, undefined, { numeric: true })) };
+      });
+      reports.push({ location: name.slice(0, 40), start, end, missing, items, source: 'EMC' });
+    }
+    return reports;
+  }
+  return null;
+}
+
 /* ------------------------------------------------------- run-out board */
 const STATUS = {
   overdue: ['bad', 'Overdue'],
@@ -1664,6 +1757,19 @@ function rel(ms) {
   const a = Math.abs(mins);
   const txt = a < 60 ? `${a} min` : a < 48 * 60 ? `${Math.round(a / 60)} h` : `${Math.round(a / 1440)} days`;
   return mins >= 0 ? `in ${txt}` : `${txt} ago`;
+}
+
+function dayRanges(list) {
+  const days = [...list].sort();
+  const out = [];
+  const short = (iso) => new Intl.DateTimeFormat('en-AU', { timeZone: 'UTC', day: 'numeric', month: 'short' }).format(new Date(iso + 'T00:00:00Z'));
+  for (let i = 0; i < days.length; i++) {
+    let j = i;
+    while (j + 1 < days.length && addDays(days[j], 1) === days[j + 1]) j++;
+    out.push(i === j ? short(days[i]) : `${short(days[i])} – ${short(days[j])}`);
+    i = j;
+  }
+  return out.join(', ');
 }
 
 function fmtDayShort(iso) {
@@ -1744,6 +1850,7 @@ function unknownHtml(sites) {
       noDip ? `${plural(noDip, 'tank')} without a dip` : '',
       noSales === s.groups.length ? 'no sales uploaded' : noSales ? `no sales for ${plural(noSales, 'grade')}` : '',
       quiet ? `no recent sales for ${plural(quiet, 'grade')}` : '',
+      ...s.warnings.filter((w) => w.startsWith('Sells ')).map((w) => w.replace(/^Sells (\S+) \(about ([\d,]+) L a day\) but has no active \S+ tank\.$/, 'sells $1 ($2 L a day) with no active $1 tank')),
     ].filter(Boolean).join(' · ');
   };
   return `<div class="section" id="board-unknown">${headHtml('Can’t forecast yet', 'Each site needs a dip for every active tank and its sales uploaded.')}
@@ -1829,7 +1936,7 @@ function guessGrade(name, grades) {
   const byCode = (code) => grades.find((g) => g.code.toUpperCase() === code) || null;
   const byName = (re) => grades.find((g) => re.test(normWords(g.name))) || null;
   if (/adblue|lpg|oil|wash|gas|kero|bottle/.test(n)) return null;
-  if (/prem\w* diesel|pdsl|premium diesel|vortex diesel|v power diesel/.test(n)) return byCode('PDSL') || byName(/premium diesel/);
+  if (/prem\w* (diesel|dsl)|pm (diesel|dsl)|pdsl|vortex diesel|v power diesel/.test(n)) return byCode('PDSL') || byName(/premium diesel/);
   if (/diesel|dsl|ulsd/.test(n)) return byCode('DSL') || byName(/^diesel/);
   if (/e ?85/.test(n)) return byCode('E85') || byName(/e85/);
   if (/e ?10/.test(n)) return byCode('E10') || byName(/e10/);
@@ -1847,31 +1954,35 @@ async function viewSales() {
   const rows = data.sites.filter((s) => s.days > 0 || s.active_tanks > 0).map((s) => `
     <li><a class="row" href="#/sites/${s.id}">
       <div class="main"><div class="title">${esc(s.name)} ${s.days ? '' : '<span class="badge warn">No sales yet</span>'}</div>
-        <div class="meta">${s.sales_code ? `Idealpos location ${esc(s.sales_code)}` : 'Not linked to an Idealpos location'}</div></div>
+        <div class="meta">${s.sales_code ? `Sales location ${esc(s.sales_code)}` : 'Not linked to a sales location yet'}</div></div>
       <div class="side">${s.days ? `<strong>${esc(fmtDayShort(s.first_day))} – ${esc(fmtDayShort(s.last_day))}</strong><br>${plural(s.days, 'day')} · ${fmtL(s.litres / s.days)} a day` : ''}</div>${icon.chev}</a></li>`).join('');
   const links = data.items.map((i) => `<li><div class="row" style="cursor:default">
-      <div class="main"><div class="title">${esc(i.item_code)} ${esc(i.item_name || '')}</div></div>
+      <div class="main"><div class="title">${esc(itemLabel(i))}</div></div>
       <div class="side">${i.grade_code ? `<span class="chip">${esc(i.grade_code)}</span>` : '<span class="muted">Not fuel, skipped</span>'}</div></div></li>`).join('');
-  return headHtml('Sales', `Daily litres sold, from Idealpos Stock Item Sales Trend reports.${latest ? ` Latest day uploaded: ${esc(fmtDayShort(latest))}.` : ''}`) +
+  return headHtml('Sales', `Daily litres sold, from Idealpos Stock Item Sales Trend reports (PDF) or EMC ezi-manager Fuel Sales Reports (Excel).${latest ? ` Latest day uploaded: ${esc(fmtDayShort(latest))}.` : ''}`) +
     `<div class="drop" id="sales-drop">
       <p style="margin:0 0 10px"><strong>Upload sales reports</strong></p>
-      <label class="btn primary" for="sales-files">Choose PDFs<input type="file" id="sales-files" accept=".pdf,application/pdf" multiple hidden></label>
-      <p class="muted" style="margin:10px 0 0;font-size:13px">Or drag them here. One report per site, listed by day. Choose as many sites as you like at once.</p>
+      <label class="btn primary" for="sales-files">Choose files<input type="file" id="sales-files" accept=".pdf,.xlsx,application/pdf" multiple hidden></label>
+      <p class="muted" style="margin:10px 0 0;font-size:13px">Or drag them here. Idealpos: one PDF per site, listed by day. EMC: one Excel file can hold several sites. Choose as many files as you like at once.</p>
     </div>
     <div id="sales-out" style="margin-top:16px"></div>
     <div class="section">${headHtml('Sales by site', withData.length ? `${plural(withData.length, 'site')} with sales` : '')}
       <div class="card">${rows ? `<ul class="rows">${rows}</ul>` : emptyHtml('No sites yet', '')}</div></div>
-    ${data.items.length ? `<div class="section">${headHtml('Idealpos items', 'Which grade each item’s sales count towards.', isAdmin() ? '<button class="btn" data-act="sales-items">Change</button>' : '')}
+    ${data.items.length ? `<div class="section">${headHtml('Sales items', 'The fuels on your sales reports, and which grade each one counts towards.', isAdmin() ? '<button class="btn" data-act="sales-items">Change</button>' : '')}
       <div class="card"><ul class="rows">${links}</ul></div></div>` : ''}
     <div class="note" style="margin-top:16px">Uploading the same days again replaces them. Days missing from a report are left out of the averages rather than counted as no sales, and today is skipped because it isn’t finished.</div>`;
 }
 
+// Idealpos items have a code and a name; EMC grades only a name, used as both.
+const itemLabel = (i) => (i.item_name && i.item_name !== i.item_code ? `${i.item_code} ${i.item_name}` : i.item_code);
+const locationLabel = (loc) => (/^\d+$/.test(loc) ? `Location ${loc}` : loc);
+
 function itemLinksDialog(items, grades, onSaved) {
   const opts = (sel) => `<option value="">Not fuel – skip</option>${grades.map((g) => `<option value="${g.id}"${g.id === sel ? ' selected' : ''}>${esc(g.code)} – ${esc(g.name)}</option>`).join('')}`;
   openDialog({
-    title: 'Idealpos items',
+    title: 'Sales items',
     sub: 'Which grade each item’s sales count towards. Items linked to the same grade are added together.',
-    body: `<div class="grid">${items.map((i, k) => `<div class="field full"><label for="it_${k}">${esc(i.item_code)} ${esc(i.item_name || '')}</label><select id="it_${k}" data-item="${k}">${opts(i.grade_id)}</select></div>`).join('')}</div>`,
+    body: `<div class="grid">${items.map((i, k) => `<div class="field full"><label for="it_${k}">${esc(itemLabel(i))}</label><select id="it_${k}" data-item="${k}">${opts(i.grade_id)}</select></div>`).join('')}</div>`,
     onSave: async () => {
       const list = items.map((i, k) => ({ item_code: i.item_code, item_name: i.item_name, grade_id: $(`#it_${k}`).value ? Number($(`#it_${k}`).value) : null }));
       await api('/sales/items', { method: 'PUT', body: { items: list } });
@@ -1889,7 +2000,7 @@ function wireSales() {
 
   const showResults = (res) => {
     const notes = (r) => [
-      r.missing.length ? `${plural(r.missing.length, 'day')} missing from the report (${esc(r.missing.map(fmtDayShort).join(', '))})` : '',
+      r.missing.length ? `${plural(r.missing.length, 'day')} missing from the report (${esc(dayRanges(r.missing))})` : '',
       r.skipped_today ? 'today skipped' : '',
       r.ignored.length ? `skipped ${esc(r.ignored.join(', '))}` : '',
     ].filter(Boolean).join('; ');
@@ -1911,7 +2022,7 @@ function wireSales() {
       const res = { reports: [] };
       for (let i = 0; i < pending.reports.length; i += 4) {
         out.innerHTML = `<div class="note">Uploading ${fmtN(Math.min(i + 4, pending.reports.length))} of ${plural(pending.reports.length, 'report')}\u2026</div>`;
-        const part = await api('/sales/import', { method: 'POST', body: { reports: pending.reports.slice(i, i + 4) } });
+        const part = await api('/sales/import', { method: 'POST', body: { reports: pending.reports.slice(i, i + 4).map((r) => ({ ...r, items: r.items.map(({ code, name, days }) => ({ code, name, days })) })) } });
         res.reports.push(...part.reports);
       }
       invalidate('sites');
@@ -1931,30 +2042,60 @@ function wireSales() {
     const [sites, grades] = await Promise.all([load('sites', true), load('grades', true)]);
     if (!isAdmin()) {
       out.innerHTML = `<div class="note warn">These need linking before the sales can go in, and only an admin can do that:<ul>
-        ${needs.locations.map((l) => `<li>Idealpos location ${esc(l.location)} (${esc(l.file)})</li>`).join('')}
-        ${needs.items.map((i) => `<li>Item ${esc(i.item_code)} ${esc(i.item_name)}</li>`).join('')}</ul></div>`;
+        ${needs.locations.map((l) => `<li>${esc(locationLabel(l.location))} (${esc(l.file)})</li>`).join('')}
+        ${needs.items.map((i) => `<li>${esc(itemLabel(i))}</li>`).join('')}</ul></div>`;
       return;
     }
     const free = sites.filter((s) => !s.sales_code);
     const used = new Set();
     const locRows = needs.locations.map((l, k) => {
-      const guess = guessSite(l.file, free.filter((s) => !used.has(s.id)));
+      const guess = guessSite(/^\d+$/.test(l.location) ? l.file : l.location, free.filter((s) => !used.has(s.id)));
       if (guess) used.add(guess.id);
-      return `<div class="field"><label for="loc_${k}">Location ${esc(l.location)} <span class="muted" style="font-weight:400">${esc(l.file)}</span></label>
+      return `<div class="field"><label for="loc_${k}">${esc(locationLabel(l.location))} <span class="muted" style="font-weight:400">${esc(l.file)}</span></label>
         <select id="loc_${k}" data-loc="${esc(l.location)}"><option value="">Choose a site…</option>${free.map((s) => `<option value="${s.id}"${guess && guess.id === s.id ? ' selected' : ''}>${esc(s.name)}</option>`).join('')}</select></div>`;
     }).join('');
+    // Which tanks each EMC grade is sold from, per site. Litres come out of the tank, so a
+    // premium diesel sold only from diesel tanks is counted as diesel.
+    const tanksOf = new Map();
+    for (const r of pending.reports) {
+      for (const it of r.items) {
+        if (!it.tanks || !it.tanks.length) continue;
+        if (!tanksOf.has(it.code)) tanksOf.set(it.code, []);
+        tanksOf.get(it.code).push({ site: r.location, tanks: it.tanks, tankDays: it.tankDays, items: r.items });
+      }
+    }
+    const nameGuess = (name) => guessGrade(name, grades);
     const itemRows = needs.items.map((i, k) => {
-      const guess = guessGrade(i.item_name, grades);
-      return `<div class="field"><label for="itm_${k}">${esc(i.item_code)} ${esc(i.item_name)}</label>
+      let guess = nameGuess(i.item_name);
+      let note = '';
+      const where = tanksOf.get(i.item_code);
+      if (where) {
+        let allDiesel = guess && guess.code === 'PDSL';
+        const parts = [];
+        for (const w of where) {
+          const others = w.items.filter((o) => o.code !== i.item_code && o.tanks && o.tanks.some((t) => w.tanks.includes(t)));
+          parts.push(`tank${w.tanks.length > 1 ? 's' : ''} ${w.tanks.join(', ')} at ${w.site}${others.length ? ` (also ${others.map((o) => o.name).join(', ')})` : ''}`);
+          // Diesel sold from the same tank on most of the same days (not a tank that changed grade).
+          const together = (t, o) => {
+            const mine = w.tankDays[t] || [];
+            const theirs = new Set((o.tankDays && o.tankDays[t]) || []);
+            return mine.length > 0 && mine.filter((d) => theirs.has(d)).length >= mine.length / 2;
+          };
+          if (!w.tanks.every((t) => others.some((o) => (nameGuess(o.name) || {}).code === 'DSL' && together(t, o)))) allDiesel = false;
+        }
+        if (allDiesel) guess = grades.find((g) => g.code === 'DSL') || guess;
+        note = `Sold from ${parts.join('; ')}.` + (allDiesel ? ' Counted as diesel because it comes out of the diesel tanks.' : '');
+      }
+      return `<div class="field"><label for="itm_${k}">${esc(itemLabel(i))}</label>
         <select id="itm_${k}" data-item="${esc(i.item_code)}" data-name="${esc(i.item_name)}"><option value="none"${guess === null ? ' selected' : ''}>Not fuel – skip</option>
         ${grades.map((g) => `<option value="${g.id}"${guess && guess.id === g.id ? ' selected' : ''}>${esc(g.code)} – ${esc(g.name)}</option>`).join('')}
-        ${guess === undefined ? '<option value="" selected>Choose…</option>' : ''}</select></div>`;
+        ${guess === undefined ? '<option value="" selected>Choose…</option>' : ''}</select>${note ? `<div class="hint">${esc(note)}</div>` : ''}</div>`;
     }).join('');
     out.innerHTML = `<div class="card pad">
       <h2>Link these the first time</h2>
       <p class="muted" style="margin:4px 0 14px">The app has filled in its best guesses. Check them; next time these reports upload without asking.</p>
-      ${locRows ? `<h3 style="font-size:14px;margin:0 0 8px">Idealpos locations → sites</h3><div class="grid">${locRows}</div>` : ''}
-      ${itemRows ? `<h3 style="font-size:14px;margin:16px 0 8px">Idealpos items → grades</h3><div class="grid">${itemRows}</div>` : ''}
+      ${locRows ? `<h3 style="font-size:14px;margin:0 0 8px">Locations on the reports → sites</h3><div class="grid">${locRows}</div>` : ''}
+      ${itemRows ? `<h3 style="font-size:14px;margin:16px 0 8px">Items on the reports → grades</h3><div class="grid">${itemRows}</div>` : ''}
       <div class="err" id="link-err"></div>
       <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap"><button class="btn primary" id="link-save">Save links and upload</button><button class="btn" id="link-cancel">Cancel</button></div>
     </div>`;
@@ -1965,11 +2106,11 @@ function wireSales() {
       const locs = $$('[data-loc]', out).map((el) => ({ location: el.dataset.loc, site: Number(el.value) }));
       const its = $$('[data-item]', out).map((el) => ({ item_code: el.dataset.item, item_name: el.dataset.name, value: el.value }));
       const missingLoc = locs.find((l) => !l.site);
-      if (missingLoc) { $('#link-err').textContent = `Choose a site for location ${missingLoc.location}.`; return; }
+      if (missingLoc) { $('#link-err').textContent = `Choose a site for ${locationLabel(missingLoc.location)}.`; return; }
       const dupe = locs.find((l, i) => locs.findIndex((x) => x.site === l.site) !== i);
       if (dupe) { $('#link-err').textContent = 'Two locations are linked to the same site.'; return; }
       const missingItem = its.find((i) => i.value === '');
-      if (missingItem) { $('#link-err').textContent = `Choose a grade for ${missingItem.item_code} ${missingItem.item_name}, or mark it not fuel.`; return; }
+      if (missingItem) { $('#link-err').textContent = `Choose a grade for ${itemLabel(missingItem)}, or mark it not fuel.`; return; }
       btn.disabled = true;
       try {
         for (const l of locs) await api(`/sites/${l.site}`, { method: 'PUT', body: { sales_code: l.location } });
@@ -1991,14 +2132,18 @@ function wireSales() {
   const handle = async (files) => {
     files = [...files].filter((f) => f);
     if (!files.length) return;
-    out.innerHTML = `<div class="note">Reading ${plural(files.length, 'report')}…</div>`;
+    out.innerHTML = `<div class="note">Reading ${plural(files.length, 'file')}…</div>`;
     const reports = [];
     const failed = [];
     for (const f of files) {
       try {
-        if (!/\.pdf$/i.test(f.name)) throw new Error('Choose PDF files.');
-        const r = await readIdealposTrend(await f.arrayBuffer());
-        reports.push({ file: f.name, ...r });
+        if (/\.pdf$/i.test(f.name)) {
+          reports.push({ file: f.name, ...(await readIdealposTrend(await f.arrayBuffer())) });
+        } else if (/\.xlsx$/i.test(f.name)) {
+          const found = readEmcFuelSales(await readXlsx(await f.arrayBuffer()));
+          if (!found) throw new Error('This spreadsheet isn’t an EMC Fuel Sales Report.');
+          for (const r of found) reports.push({ file: f.name, ...r });
+        } else throw new Error('Choose PDF or Excel (.xlsx) files.');
       } catch (err) {
         failed.push({ file: f.name, error: err.message });
       }
@@ -2006,13 +2151,13 @@ function wireSales() {
     pending = { reports };
     const sameLoc = reports.filter((r, i) => reports.findIndex((x) => x.location === r.location) !== i);
     out.innerHTML = `<div class="card"><table class="summary"><thead><tr><th>Report</th><th class="hide-sm">Location</th><th style="text-align:right">Days</th></tr></thead><tbody>
-      ${reports.map((r) => `<tr><td><strong>${esc(r.file)}</strong><div class="muted" style="font-size:12px">${esc(fmtDayShort(r.start))} – ${esc(fmtDayShort(r.end))} · ${plural(r.items.length, 'item')}${r.missing.length ? ` · ${plural(r.missing.length, 'day')} missing` : ''}</div></td>
+      ${reports.map((r) => `<tr><td><strong>${esc(r.source === 'EMC' ? r.location : r.file)}</strong><div class="muted" style="font-size:12px">${r.source === 'EMC' ? `${esc(r.file)} · ` : ''}${esc(fmtDayShort(r.start))} – ${esc(fmtDayShort(r.end))} · ${plural(r.items.length, 'item')}${r.missing.length ? ` · ${plural(r.missing.length, 'day')} missing` : ''}</div></td>
         <td class="hide-sm">${esc(r.location)}</td><td class="n">${fmtN(Object.keys(r.items[0] ? r.items[0].days : {}).length)}</td></tr>`).join('')}
       ${failed.map((f) => `<tr><td><strong>${esc(f.file)}</strong><div style="color:var(--danger);font-size:13px">${esc(f.error)}</div></td><td class="hide-sm"></td><td class="n">—</td></tr>`).join('')}
       </tbody></table>
       ${sameLoc.length ? `<div class="note warn" style="margin:0 16px 12px">Several reports are for the same location. Where their days overlap, the later file wins.</div>` : ''}
       <div style="padding:12px 16px;border-top:1px solid var(--border);display:flex;gap:8px;flex-wrap:wrap">
-        ${reports.length ? `<button class="btn primary" id="sales-go">Upload ${plural(reports.length, 'report')}</button>` : ''}<button class="btn" id="sales-cancel">Cancel</button>
+        ${reports.length ? `<button class="btn primary" id="sales-go">Upload ${reports.length === 1 ? '1 site' : `${fmtN(reports.length)} sites`}</button>` : ''}<button class="btn" id="sales-cancel">Cancel</button>
         ${failed.length ? `<span class="muted" style="align-self:center;font-size:13px">${plural(failed.length, 'file')} couldn’t be read and will be skipped.</span>` : ''}</div></div>`;
     $('#sales-cancel').onclick = () => { out.innerHTML = ''; $('#sales-files').value = ''; };
     if (reports.length) $('#sales-go').onclick = (e) => upload(e.target);
