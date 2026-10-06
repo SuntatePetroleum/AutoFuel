@@ -120,6 +120,28 @@
   .bg-now .level { margin-top: 6px; }
   .bs-warn { margin: 0; padding: 10px 16px 12px 34px; border-top: 1px solid var(--border); color: var(--warn); background: var(--warn-soft); font-size: 13px; }
   .bs-warn li + li { margin-top: 2px; }
+  .summary th.n { text-align: right; }
+  .plan-start { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--muted); white-space: nowrap; }
+  .plan-start input { width: auto; min-width: 140px; padding: 7px 9px; }
+  .run { overflow: hidden; }
+  .run-head { display: flex; gap: 10px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .run-head select { width: auto; min-width: 150px; font-weight: 600; }
+  .run-stop { display: flex; gap: 10px; align-items: center; padding: 12px 16px 6px; flex-wrap: wrap; }
+  .run-stop select { flex: 1 1 220px; width: auto; }
+  .run-stop input[type=time] { width: auto; min-width: 140px; }
+  .run-num { width: 24px; height: 24px; border-radius: 50%; background: var(--accent-soft); color: var(--accent-text); display: inline-flex; align-items: center; justify-content: center; font-weight: 700; font-size: 13px; flex: none; }
+  .run-sum { padding: 0 16px 6px 50px; }
+  .plan-table { font-size: 13px; }
+  .plan-table td, .plan-table th { padding: 6px 8px; }
+  .plan-table tr.over td { color: var(--danger); }
+  .plan-table td { white-space: nowrap; vertical-align: top; }
+  .plan-table .sub { display: block; font-size: 11px; color: var(--muted); }
+  .run-comps { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px 10px; padding: 12px 16px; border-top: 1px solid var(--border); }
+  .run-comp { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+  .run-comp b { color: var(--text); margin-right: 4px; }
+  .run-comp select { padding: 6px 8px; font-size: 13px; }
+  .run-comp.empty select { color: var(--muted); }
+  .run-foot { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--border); flex-wrap: wrap; }
 
   .details { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 14px 20px; }
   .details dt { font-size: 12px; color: var(--muted); }
@@ -188,6 +210,10 @@
     .row { padding: 12px; }
     .hide-sm { display: none !important; }
     .bg-row { grid-template-columns: 58px 1.4fr 1fr; gap: 10px; }
+    .run-sum { padding-left: 16px; padding-right: 12px; }
+    .plan-table td, .plan-table th { padding: 6px 4px; }
+    .run-comps { grid-template-columns: 1fr 1fr; }
+    .plan-start { width: 100%; }
     main { padding-top: 16px; }
   }
 </style>
@@ -517,7 +543,7 @@ function wireCompartments() {
 
 /* -------------------------------------------------------------- views */
 const NAV = [
-  ['board', 'Board'], ['sites', 'Sites'], ['dips', 'Dips'], ['sales', 'Sales'], ['tanks', 'Tanks'], ['trucks', 'Trucks'], ['grades', 'Grades'],
+  ['board', 'Board'], ['plan', 'Plan'], ['sites', 'Sites'], ['dips', 'Dips'], ['sales', 'Sales'], ['tanks', 'Tanks'], ['trucks', 'Trucks'], ['grades', 'Grades'],
   ['terminals', 'Terminals'], ['drivers', 'Drivers'], ['settings', 'Settings'], ['import', 'Import'], ['users', 'Users', true],
 ];
 
@@ -1808,7 +1834,8 @@ function boardSiteHtml(s, b) {
   }).join('');
   return `<div class="card board-site" data-status="${s.status}" data-name="${esc(s.name.toLowerCase())}" data-flags="${s.warnings.length ? 1 : 0}">
     <div class="bs-head">
-      <div class="bs-title"><a href="#/sites/${s.id}">${esc(s.name)}</a><span class="badge ${kind}">${label}</span></div>
+      <div class="bs-title"><a href="#/sites/${s.id}">${esc(s.name)}</a><span class="badge ${kind}">${label}</span>
+        ${(state.boardRuns || []).filter((r) => r.status === 'planned').flatMap((r) => r.plan.stops.filter((st) => st.site_id === s.id).map((st) => `<a class="badge ok" href="#/plan" style="text-decoration:none">Run planned · ${esc(r.plan.truck_name)} · ${esc(fmtTime(st.at))}</a>`)).join('')}</div>
       <div class="bs-when">${when}</div>
       <div class="bs-meta">${[partial, opens, s.room_now ? `${fmtL(s.room_now)} room now` : '', s.sales_to ? `sales to ${esc(fmtDayShort(s.sales_to))}` : ''].filter(Boolean).join(' · ')}</div>
     </div>
@@ -1820,6 +1847,7 @@ function boardSiteHtml(s, b) {
 async function viewBoard() {
   const b = await api('/board');
   state.board = b;
+  try { state.boardRuns = await api(`/runs?date=${b.today}`); } catch { state.boardRuns = []; }
   const count = (st) => b.sites.filter((s) => s.status === st).length;
   const flagged = b.sites.filter((s) => s.warnings.length && s.groups.length).length;
   const salesTo = b.sites.map((s) => s.sales_to).filter(Boolean).sort();
@@ -1886,7 +1914,7 @@ function boardGradeDialog(siteId, gradeId) {
         ${row('Runs empty', g.empty_at == null ? 'Not in the next 30 days' : g.empty_at <= b.now + 60000 ? 'Estimated empty now' : `${esc(fmtWhen(g.empty_at))}<div class="hint">${rel(g.empty_at)}</div>`)}
       </dl>
       <h2 style="margin:18px 0 8px">Forecast sales</h2>
-      <table class="summary"><tbody>${g.next_days.map((d) => `<tr><td>${esc(fmtDayShort(d.day))}</td><td class="n">${fmtL(d.litres)}</td></tr>`).join('')}</tbody></table>`;
+      <table class="summary"><tbody>${g.next_days.slice(0, 7).map((d) => `<tr><td>${esc(fmtDayShort(d.day))}</td><td class="n">${fmtL(d.litres)}</td></tr>`).join('')}</tbody></table>`;
   }
   openDialog({ title: `${s.name} · ${g.grade_code}`, sub: g.grade_name, readOnly: true, body });
 }
@@ -2168,6 +2196,630 @@ function wireSales() {
   drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); handle(e.dataTransfer.files); });
 }
 
+/* ------------------------------------------------------ load optimiser */
+// Works out which grade goes in each compartment of one truck, for one or two stops.
+// Whole compartments only; each grade's total stays within the room its tanks will have
+// at arrival. Priorities, in order:
+//   1. The first stop's grades with the fewest hours of cover get fuel first (covers are
+//      compared from the lowest up, capped at PLAN_CAP_H, so a grade with plenty of fuel
+//      doesn't compete with one about to run low).
+//   2. The same for the second stop, with the compartments the first stop doesn't need.
+//   3. The most litres on the truck.
+//   4. Longer cover overall.
+const PLAN_CAP_H = 72;
+
+// Compartments grouped by size: identical compartments are interchangeable.
+function compartmentClasses(comps) {
+  const bySize = new Map();
+  for (const c of comps) {
+    if (!bySize.has(c.capacity)) bySize.set(c.capacity, []);
+    bySize.get(c.capacity).push(c.position);
+  }
+  return [...bySize].sort((a, b) => b[0] - a[0]).map(([size, positions]) => ({ size, positions: positions.sort((a, b) => a - b) }));
+}
+
+// Calls back with every way to share `counts[i]` compartments of each class between the
+// options (grades), keeping each option within its room. Option totals are passed as litres.
+function eachAllocation(classes, counts, rooms, visit) {
+  const n = rooms.length;
+  const caps = rooms.slice();
+  const alloc = classes.map(() => new Array(n).fill(0));
+  const litres = new Array(n).fill(0);
+  const byClass = (i) => {
+    if (i === classes.length) { visit(alloc, litres); return; }
+    const size = classes[i].size;
+    const share = (j, left) => {
+      if (j === n) { byClass(i + 1); return; }
+      const most = Math.min(left, Math.floor(caps[j] / size));
+      for (let k = 0; k <= most; k++) {
+        alloc[i][j] = k; caps[j] -= k * size; litres[j] += k * size;
+        share(j + 1, left - k);
+        caps[j] += k * size; litres[j] -= k * size;
+      }
+      alloc[i][j] = 0;
+    };
+    share(0, counts[i]);
+  };
+  byClass(0);
+}
+
+// Hours until a grade falls to its lowest level after `add` litres go in.
+function coverHours(g, add) {
+  if (!(g.rateH > 0)) return Infinity;
+  return (g.level + add - g.floor) / g.rateH;
+}
+
+// Covers sorted from lowest up; `cap` rounds down to whole hours and caps them.
+function coverVector(grades, litres, cap) {
+  const v = grades.map((g, j) => coverHours(g, litres[j]));
+  return v.map((h) => (cap ? Math.floor(Math.min(h, PLAN_CAP_H)) : Math.min(h, 1e9))).sort((a, b) => a - b);
+}
+
+function compareVectors(a, b) {
+  for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return 0;
+}
+
+const massOf = (grades, litres) => grades.reduce((m, g, j) => m + litres[j] * (g.density || 0.8), 0);
+
+// Best load for one stop from the compartments in `counts`. Returns its score and litres per grade.
+function bestForStop(classes, counts, stop, maxMass) {
+  const rooms = stop.grades.map((g) => Math.max(0, g.room));
+  let best = null;
+  eachAllocation(classes, counts, rooms, (alloc, litres) => {
+    if (maxMass != null && massOf(stop.grades, litres) > maxMass) return;
+    const total = litres.reduce((a, b) => a + b, 0);
+    const cand = { capped: coverVector(stop.grades, litres, true), total, full: coverVector(stop.grades, litres, false) };
+    if (!best || compareVectors(cand.capped, best.capped) > 0 ||
+        (compareVectors(cand.capped, best.capped) === 0 && (cand.total > best.total ||
+          (cand.total === best.total && compareVectors(cand.full, best.full) > 0)))) {
+      best = { ...cand, litres: litres.slice(), alloc: alloc.map((r) => r.slice()) };
+    }
+  });
+  return best;
+}
+
+// Plans one truck for one or two stops. `stops[i].grades` are
+// { grade_id, code, room, level, floor, rateH, density }.
+function planTruck(comps, stops, maxMassKg) {
+  const classes = compartmentClasses(comps);
+  const all = classes.map((c) => c.positions.length);
+  const A = stops[0];
+  const B = stops[1];
+  let pick;
+  if (!B) {
+    pick = { a: bestForStop(classes, all, A, maxMassKg), b: null, rest: null };
+  } else {
+    // Every first-stop load that's as good as possible for the first stop, grouped by the
+    // compartments it leaves free; the second stop then gets the best of what's left.
+    let bestCapped = null;
+    const byRest = new Map();
+    const roomsA = A.grades.map((g) => Math.max(0, g.room));
+    eachAllocation(classes, all, roomsA, (alloc, litres) => {
+      if (maxMassKg != null && massOf(A.grades, litres) > maxMassKg) return;
+      const capped = coverVector(A.grades, litres, true);
+      const cmp = bestCapped ? compareVectors(capped, bestCapped) : 1;
+      if (cmp < 0) return;
+      if (cmp > 0) { bestCapped = capped; byRest.clear(); }
+      const rest = all.map((n, i) => n - alloc[i].reduce((a, b) => a + b, 0));
+      const key = rest.join(',');
+      const full = coverVector(A.grades, litres, false);
+      const prev = byRest.get(key);
+      if (!prev || compareVectors(full, prev.full) > 0) {
+        byRest.set(key, { capped, full, total: litres.reduce((a, b) => a + b, 0), litres: litres.slice(), alloc: alloc.map((r) => r.slice()), rest });
+      }
+    });
+    for (const a of byRest.values()) {
+      const b = bestForStop(classes, a.rest, B, maxMassKg != null ? maxMassKg - massOf(A.grades, a.litres) : null);
+      const cand = { a, b, rest: a.rest };
+      if (!pick) { pick = cand; continue; }
+      const c1 = compareVectors(b.capped, pick.b.capped);
+      const t1 = a.total + b.total;
+      const t0 = pick.a.total + pick.b.total;
+      if (c1 > 0 || (c1 === 0 && (t1 > t0 || (t1 === t0 && (compareVectors(a.full, pick.a.full) > 0 ||
+          (compareVectors(a.full, pick.a.full) === 0 && compareVectors(b.full, pick.b.full) > 0)))))) pick = cand;
+    }
+  }
+  // Turn class counts back into compartment numbers: bigger compartments first, in order.
+  const used = classes.map(() => 0);
+  const out = [];
+  const place = (res, stopIndex, stop) => {
+    if (!res) return;
+    classes.forEach((c, i) => {
+      stop.grades.forEach((g, j) => {
+        for (let k = 0; k < res.alloc[i][j]; k++) {
+          out.push({ position: c.positions[used[i]], capacity: c.size, stop: stopIndex, grade_id: g.grade_id });
+          used[i]++;
+        }
+      });
+    });
+  };
+  place(pick.a, 0, A);
+  if (B) place(pick.b, 1, B);
+  return out.sort((x, y) => x.position - y.position);
+}
+
+/* ---------------------------------------------------------- load plans */
+// Time in the company's zone, for arrival times on today's plan.
+const zoneParts = new Map();
+function zoneOffsetAt(ms) {
+  const tz = zone();
+  if (!zoneParts.has(tz)) zoneParts.set(tz, new Intl.DateTimeFormat('en-US', { timeZone: tz, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' }));
+  const p = Object.fromEntries(zoneParts.get(tz).formatToParts(new Date(ms)).map((x) => [x.type, x.value]));
+  return Date.UTC(+p.year, +p.month - 1, +p.day, +p.hour, +p.minute, +p.second) - (ms - (ms % 1000));
+}
+function dayStartMs(iso) {
+  const wall = Date.parse(iso + 'T00:00:00Z');
+  let t = wall - zoneOffsetAt(wall);
+  t = wall - zoneOffsetAt(t);
+  return t;
+}
+const localIsoOf = (ms) => new Date(ms + zoneOffsetAt(ms)).toISOString().slice(0, 10);
+const hhmm = (ms) => new Date(ms + zoneOffsetAt(ms)).toISOString().slice(11, 16);
+const fmtDayOf = (ms) => new Intl.DateTimeFormat('en-AU', { timeZone: zone(), weekday: 'short', day: 'numeric', month: 'short' }).format(new Date(ms));
+const fmtTime = (ms) => new Intl.DateTimeFormat('en-AU', { timeZone: zone(), hour: 'numeric', minute: '2-digit' }).format(new Date(ms));
+function atFromTime(day, value) {
+  const [h, m] = value.split(':').map(Number);
+  return dayStartMs(day) + (h * 60 + m) * 60000;
+}
+
+// Litres a grade sells between two moments, from the board's daily forecast.
+function soldBetweenC(g, t0, t1) {
+  if (t1 <= t0) return 0;
+  const perDay = new Map((g.next_days || []).map((d) => [d.day, d.litres]));
+  let total = 0;
+  for (let day = localIsoOf(t0), n = 0; n < 60; day = addDays(day, 1), n++) {
+    const a = dayStartMs(day);
+    const b = dayStartMs(addDays(day, 1));
+    if (a >= t1) break;
+    const overlap = Math.min(b, t1) - Math.max(a, t0);
+    if (overlap > 0) total += ((perDay.has(day) ? perDay.get(day) : g.avg_daily) * overlap) / (b - a);
+  }
+  return total;
+}
+// When a grade starting at `level0` at `t0` falls to `target` (null if not within 21 days).
+function whenLevelC(g, t0, level0, target) {
+  if (level0 <= target) return t0;
+  const perDay = new Map((g.next_days || []).map((d) => [d.day, d.litres]));
+  let level = level0;
+  let t = t0;
+  for (let day = localIsoOf(t0), n = 0; n < 21; day = addDays(day, 1), n++) {
+    const b = dayStartMs(addDays(day, 1));
+    const rate = (perDay.has(day) ? perDay.get(day) : g.avg_daily) / (b - dayStartMs(day));
+    const end = level - rate * (b - t);
+    if (end <= target) return rate > 0 ? t + (level - target) / rate : null;
+    level = end;
+    t = b;
+  }
+  return null;
+}
+
+// What a site's tanks can take, grade by grade, if a truck arrives at `at`.
+function stopNeeds(siteId, at) {
+  const b = state.board;
+  const s = b.sites.find((x) => x.id === siteId);
+  const grades = [];
+  const skipped = [];
+  if (!s) return { site: null, grades, skipped };
+  const density = new Map((state.cache.grades || []).map((g) => [g.id, g.density]));
+  for (const g of s.groups) {
+    if (g.level == null) { skipped.push(g.grade_code); continue; }
+    const level = Math.max(0, g.level - soldBetweenC(g, b.now, Math.max(b.now, at)));
+    grades.push({
+      grade_id: g.grade_id, code: g.grade_code, group: g, level, floor: g.floor, fill_to: g.fill_to, capacity: g.capacity,
+      room: Math.max(0, Math.floor(g.fill_to - level)), rateH: g.avg_daily / 24, density: density.get(g.grade_id) || 0.8,
+    });
+  }
+  return { site: s, grades, skipped };
+}
+
+const SIZE_RANK = { Rigid: 1, Semi: 2, 'B-double': 3, 'Road train': 4 };
+function siteAllows(site, truck) {
+  if (!site || !site.max_combination || site.max_combination === 'Any' || !truck.combination_class) return true;
+  return (SIZE_RANK[truck.combination_class] || 0) <= (SIZE_RANK[site.max_combination] || 9);
+}
+
+function kmBetween(a, b) {
+  if (a == null || b == null || a.lat == null || b.lat == null) return null;
+  const r = (d) => (d * Math.PI) / 180;
+  const h = Math.sin(r(b.lat - a.lat) / 2) ** 2 + Math.cos(r(a.lat)) * Math.cos(r(b.lat)) * Math.sin(r(b.lng - a.lng) / 2) ** 2;
+  return 12742 * Math.asin(Math.sqrt(h));
+}
+
+const roundUp = (ms, mins) => Math.ceil(ms / (mins * 60000)) * mins * 60000;
+
+// Works out the loads for a draft run from its truck, stops and times.
+function optimiseDraft(d) {
+  const truck = (state.cache.trucks || []).find((t) => t.id === d.truck_id);
+  if (!truck) { d.comps = []; return; }
+  const needs = d.stops.map((st) => stopNeeds(st.site_id, st.at));
+  const maxMass = truck.max_payload_t ? truck.max_payload_t * 1000 : null;
+  const plan = planTruck(truck.compartments.map((c, i) => ({ position: i + 1, capacity: c })), needs.map((n) => ({ grades: n.grades })), maxMass);
+  d.comps = truck.compartments.map((c, i) => {
+    const hit = plan.find((p) => p.position === i + 1);
+    return { position: i + 1, capacity: c, target: hit ? { stop: hit.stop, grade_id: hit.grade_id } : null };
+  });
+  d.manual = false;
+}
+
+let draftSeq = 0;
+function newDraft(truckId, stops) {
+  const d = { key: ++draftSeq, truck_id: truckId, stops, comps: [], manual: false };
+  optimiseDraft(d);
+  return d;
+}
+
+const litresTo = (d, stop, gradeId) => d.comps.filter((c) => c.target && c.target.stop === stop && c.target.grade_id === gradeId).reduce((a, c) => a + c.capacity, 0);
+
+// Suggests a run for each free truck: the most urgent site first, then a second stop
+// nearby with whatever compartments are left.
+function suggestRuns() {
+  const b = state.board;
+  const start = state.planStart;
+  const sitesById = new Map((state.cache.sites || []).map((s) => [s.id, s]));
+  const confirmed = (state.planRuns || []).filter((r) => r.status === 'planned');
+  const coveredSites = new Set(confirmed.flatMap((r) => r.plan.stops.map((st) => st.site_id)));
+  const busyTrucks = new Set(confirmed.map((r) => r.truck_id));
+  const live = b.sites.filter((s) => s.status !== 'unknown' && s.groups.some((g) => g.level != null) && !coveredSites.has(s.id));
+  const needy = live.filter((s) => ['overdue', 'today', 'soon'].includes(s.status)).sort((x, y) => x.deliver_by - y.deliver_by);
+  const extras = live.filter((s) => s.status === 'ok' && s.window_opens != null && s.deliver_by != null && s.deliver_by - b.now < 4 * 86400000)
+    .sort((x, y) => x.deliver_by - y.deliver_by);
+  const trucks = (state.cache.trucks || []).filter((t) => t.available && t.compartments.length && !busyTrucks.has(t.id))
+    .sort((x, y) => y.total_capacity_l - x.total_capacity_l);
+  const minDrop = state.settings.min_drop_l || 0;
+  const used = new Set();
+  const drafts = [];
+  const arriveA = (s) => roundUp(Math.max(start, s.window_opens || start), 5);
+  const score = (d, stop) => {
+    const n = stopNeeds(d.stops[stop].site_id, d.stops[stop].at);
+    const litres = n.grades.map((g) => litresTo(d, stop, g.grade_id));
+    return { capped: coverVector(n.grades, litres, true), total: litres.reduce((a, x) => a + x, 0) };
+  };
+  for (const s of needy) {
+    if (used.has(s.id) || !trucks.length) continue;
+    const at = arriveA(s);
+    // The truck that does the most for this site; smaller trucks win ties.
+    let best = null;
+    for (const t of trucks) {
+      if (!siteAllows(sitesById.get(s.id), t)) continue;
+      const d = newDraft(t.id, [{ site_id: s.id, at }]);
+      const sc = score(d, 0);
+      const better = !best || compareVectors(sc.capped, best.sc.capped) > 0 ||
+        (compareVectors(sc.capped, best.sc.capped) === 0 && (sc.total > best.sc.total || (sc.total === best.sc.total && t.total_capacity_l < best.t.total_capacity_l)));
+      if (better) best = { d, sc, t };
+    }
+    if (!best || best.sc.total <= 0) continue;
+    used.add(s.id);
+    let draft = best.d;
+    // A second stop, if enough of the truck is left for a worthwhile drop.
+    const spare = best.t.total_capacity_l - best.sc.total;
+    if (spare >= minDrop) {
+      const here = sitesById.get(s.id);
+      const candidates = [...needy, ...extras].filter((x) => !used.has(x.id) && siteAllows(sitesById.get(x.id), best.t))
+        .map((x) => ({ x, km: kmBetween(here, sitesById.get(x.id)) }))
+        .filter((c) => c.km != null && c.km <= 120)
+        .slice(0, 6);
+      for (const { x, km } of candidates) {
+        const drop = (here && here.drop_minutes) || 45;
+        const atB = roundUp(Math.max(at + (drop + (km * 1.3 / 75) * 60) * 60000, x.window_opens || 0), 5);
+        const two = newDraft(best.t.id, [{ site_id: s.id, at }, { site_id: x.id, at: atB }]);
+        const sb = score(two, 1);
+        if (sb.total >= minDrop) { draft = two; used.add(x.id); break; }
+      }
+    }
+    drafts.push(draft);
+    trucks.splice(trucks.indexOf(best.t), 1);
+  }
+  state.planDrafts = drafts;
+}
+
+function planWarnings(d) {
+  const out = [];
+  const truck = (state.cache.trucks || []).find((t) => t.id === d.truck_id);
+  const sitesById = new Map((state.cache.sites || []).map((s) => [s.id, s]));
+  if (truck && !truck.available) out.push(`${truck.name} is marked not available.`);
+  d.stops.forEach((st, i) => {
+    const n = stopNeeds(st.site_id, st.at);
+    const site = sitesById.get(st.site_id);
+    if (!n.site) return;
+    if (st.at < Date.now() - 5 * 60000) out.push(`${n.site.name}: the arrival time has passed.`);
+    if (site && site.delivery_from && site.delivery_until && !(site.delivery_from === '00:00' && site.delivery_until === '23:59')) {
+      const t = hhmm(st.at);
+      if (t < site.delivery_from || t > site.delivery_until) out.push(`${n.site.name} takes deliveries ${site.delivery_from}–${site.delivery_until}.`);
+    }
+    if (truck && !siteAllows(site, truck)) out.push(`${n.site.name} can’t take a ${truck.combination_class}.`);
+    for (const code of n.skipped) out.push(`${n.site.name} ${code} has no dip or no sales, so nothing is planned for it.`);
+    for (const g of n.grades) {
+      const x = litresTo(d, i, g.grade_id);
+      if (x > g.room) out.push(`${n.site.name} ${g.code}: ${fmtL(x)} won’t fit. There’s room for ${fmtL(g.room)} at ${fmtTime(st.at)}.`);
+      else if (!x && g.level <= g.floor) out.push(`${n.site.name} ${g.code} will be at or below its lowest level and gets nothing on this run.`);
+    }
+  });
+  if (truck && truck.max_payload_t) {
+    const density = new Map((state.cache.grades || []).map((g) => [g.id, g.density || 0.8]));
+    const kg = d.comps.reduce((a, c) => a + (c.target ? c.capacity * (density.get(c.target.grade_id) || 0.8) : 0), 0);
+    if (kg > truck.max_payload_t * 1000) out.push(`About ${fmtN(Math.round(kg / 100) / 10)} t of fuel, over ${truck.name}’s ${fmtN(truck.max_payload_t)} t payload.`);
+  }
+  return out;
+}
+
+function stopSummaryHtml(d, i) {
+  const st = d.stops[i];
+  const n = stopNeeds(st.site_id, st.at);
+  if (!n.grades.length) return '<div class="empty" style="padding:12px">No grades with a dip at this site.</div>';
+  return `<table class="summary plan-table"><thead><tr><th>Grade</th><th class="n">Room at arrival</th><th class="n">Delivering</th><th class="n hide-sm">After drop</th><th class="n">Lasts until</th></tr></thead><tbody>
+    ${n.grades.map((g) => {
+      const x = litresTo(d, i, g.grade_id);
+      const after = g.level + x;
+      const until = whenLevelC(g.group, st.at, after, g.floor);
+      const over = x > g.room;
+      return `<tr${over ? ' class="over"' : ''}><td><span class="chip">${esc(g.code)}</span></td><td class="n">${fmtL(g.room)}</td>
+        <td class="n"><strong>${x ? fmtL(x) : '—'}</strong></td><td class="n hide-sm">${fmtL(after)} · ${pct(after, g.capacity)}%</td>
+        <td class="n">${until == null ? '21+ days' : until <= st.at ? '<span class="badge bad">Below lowest</span>' : `${esc(fmtDayOf(until))}<span class="sub">${esc(fmtTime(until))}</span>`}</td></tr>`;
+    }).join('')}</tbody></table>`;
+}
+
+function siteOptions(selected, allowNone) {
+  const b = state.board;
+  const rank = { overdue: 0, today: 1, soon: 2, ok: 3, unknown: 4 };
+  const sites = b.sites.filter((s) => s.groups.length).slice().sort((x, y) => rank[x.status] - rank[y.status] || x.name.localeCompare(y.name));
+  return (allowNone ? `<option value="">No second stop</option>` : '') +
+    sites.map((s) => `<option value="${s.id}"${s.id === selected ? ' selected' : ''}>${esc(s.name)}${s.status === 'overdue' ? ' · overdue' : s.status === 'today' ? ' · within 24 h' : s.status === 'soon' ? ' · within 48 h' : ''}</option>`).join('');
+}
+
+function draftHtml(d) {
+  const trucks = state.cache.trucks || [];
+  const truck = trucks.find((t) => t.id === d.truck_id);
+  const sitesName = (id) => (state.board.sites.find((s) => s.id === id) || {}).name || 'Unknown site';
+  const optionsFor = (c) => {
+    const opts = ['<option value="">Empty</option>'];
+    d.stops.forEach((st, i) => {
+      const n = stopNeeds(st.site_id, st.at);
+      for (const g of n.grades) {
+        const val = `${i}:${g.grade_id}`;
+        const sel = c.target && c.target.stop === i && c.target.grade_id === g.grade_id ? ' selected' : '';
+        opts.push(`<option value="${val}"${sel}>${esc(g.code)} → ${esc(sitesName(st.site_id))}</option>`);
+      }
+    });
+    return opts.join('');
+  };
+  const total = d.comps.reduce((a, c) => a + (c.target ? c.capacity : 0), 0);
+  const warns = planWarnings(d);
+  const stopRow = (i) => {
+    const st = d.stops[i];
+    return `<div class="run-stop">
+      <span class="run-num">${i + 1}</span>
+      <select data-f="site" data-stop="${i}" aria-label="Stop ${i + 1} site">${siteOptions(st ? st.site_id : null, i > 0)}</select>
+      ${st ? `<input type="time" data-f="at" data-stop="${i}" value="${hhmm(st.at)}" aria-label="Stop ${i + 1} arrival time">` : ''}
+    </div>${st ? `<div class="run-sum">${stopSummaryHtml(d, i)}</div>` : ''}`;
+  };
+  return `<div class="card run" data-draft="${d.key}">
+    <div class="run-head">
+      <select data-f="truck" aria-label="Truck">${trucks.map((t) => `<option value="${t.id}"${t.id === d.truck_id ? ' selected' : ''}>${esc(t.name)}${t.available ? '' : ' (not available)'}</option>`).join('')}</select>
+      <span class="muted num">${truck ? `${fmtL(total)} of ${fmtL(truck.total_capacity_l)}` : ''}${d.manual ? ' · changed by hand' : ''}</span>
+      <span class="spacer"></span>
+      <button class="btn sm ghost" data-act="draft-remove">Remove</button>
+    </div>
+    ${stopRow(0)}${stopRow(1)}
+    <div class="run-comps">${d.comps.map((c) => `<label class="run-comp${c.target ? '' : ' empty'}"><span><b>C${c.position}</b> ${fmtN(c.capacity)} L</span>
+      <select data-f="comp" data-pos="${c.position}">${optionsFor(c)}</select></label>`).join('') || '<span class="muted">This truck has no compartments set up.</span>'}</div>
+    ${warns.length ? `<ul class="bs-warn" style="margin:0">${warns.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}
+    <div class="run-foot">
+      <button class="btn primary" data-act="draft-confirm"${total ? '' : ' disabled'}>Confirm run</button>
+      ${d.manual ? '<button class="btn" data-act="draft-reset">Work out loads again</button>' : ''}
+      <button class="btn ghost" data-act="draft-sheet"${total ? '' : ' disabled'}>Copy load sheet</button>
+    </div>
+  </div>`;
+}
+
+function tanksFor(siteId, gradeId) {
+  const s = state.board && state.board.sites.find((x) => x.id === siteId);
+  const g = s && s.groups.find((x) => x.grade_id === gradeId);
+  return g ? g.tanks.map((t) => t.name) : [];
+}
+
+// Plain text for a text message to the driver.
+function loadSheetText(run) {
+  const p = run.plan;
+  const day = new Intl.DateTimeFormat('en-AU', { timeZone: 'UTC', weekday: 'short', day: 'numeric', month: 'short' }).format(new Date(run.run_date + 'T00:00:00Z'));
+  const lines = [`${p.truck_name}${p.truck_rego ? ` (${p.truck_rego})` : ''} · ${day}${p.driver_name ? ` · ${p.driver_name}` : ''}`, '', 'LOAD'];
+  for (const c of p.compartments) lines.push(`C${c.position}  ${fmtN(c.litres)} L  ${c.grade_code} → ${p.stops[c.stop].site_name}`);
+  lines.push(`Total ${fmtN(p.compartments.reduce((a, c) => a + c.litres, 0))} L`);
+  p.stops.forEach((st, i) => {
+    lines.push('', `DROP ${i + 1}: ${st.site_name}, about ${fmtTime(st.at)}`);
+    const byGrade = new Map();
+    for (const c of p.compartments.filter((c) => c.stop === i)) {
+      if (!byGrade.has(c.grade_code)) byGrade.set(c.grade_code, { litres: 0, comps: [], grade_id: c.grade_id });
+      const g = byGrade.get(c.grade_code);
+      g.litres += c.litres;
+      g.comps.push(`C${c.position}`);
+    }
+    for (const [code, g] of byGrade) {
+      const tanks = tanksFor(st.site_id, g.grade_id);
+      lines.push(`${code}  ${fmtN(g.litres)} L  (${g.comps.join(', ')})${tanks.length ? `  into ${tanks.join(' + ')}` : ''}`);
+    }
+  });
+  lines.push('', 'Dip each tank before dropping. If a load won’t fit, call the office before dropping.');
+  return lines.join('\n');
+}
+
+function draftToRun(d) {
+  const truck = (state.cache.trucks || []).find((t) => t.id === d.truck_id);
+  const grades = new Map((state.cache.grades || []).map((g) => [g.id, g.code]));
+  const siteName = (id) => (state.board.sites.find((s) => s.id === id) || {}).name || 'Unknown site';
+  return {
+    run_date: state.board.today,
+    truck_id: d.truck_id,
+    plan: {
+      truck_name: truck ? truck.name : '', truck_rego: truck ? truck.rego : '',
+      stops: d.stops.map((st) => ({ site_id: st.site_id, at: st.at, site_name: siteName(st.site_id) })),
+      compartments: d.comps.filter((c) => c.target).map((c) => ({ position: c.position, capacity: c.capacity, litres: c.capacity, stop: c.target.stop, grade_id: c.target.grade_id, grade_code: grades.get(c.target.grade_id) })),
+    },
+  };
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast('Load sheet copied');
+  } catch {
+    openDialog({ title: 'Load sheet', sub: 'Select and copy this text.', readOnly: true, body: `<textarea rows="16" style="width:100%;font-family:var(--mono);font-size:13px" readonly>${esc(text)}</textarea>` });
+  }
+}
+
+function runCardHtml(r) {
+  const p = r.plan;
+  const total = p.compartments.reduce((a, c) => a + c.litres, 0);
+  return `<div class="card run" data-run="${r.id}">
+    <div class="run-head"><strong>${esc(p.truck_name || 'Truck')}</strong>
+      <span class="badge ${r.status === 'done' ? 'off' : 'ok'}">${r.status === 'done' ? 'Done' : 'Confirmed'}</span>
+      <span class="muted num">${fmtL(total)}</span><span class="spacer"></span>
+      <button class="btn sm ghost danger" data-act="run-delete">Delete</button></div>
+    ${p.stops.map((st, i) => `<div class="run-stop"><span class="run-num">${i + 1}</span><strong>${esc(st.site_name)}</strong><span class="muted">about ${esc(fmtTime(st.at))}</span></div>
+      <div class="run-comps" style="padding-top:0">${p.compartments.filter((c) => c.stop === i).map((c) => `<span class="comp"><b>C${c.position}</b>${esc(c.grade_code)} ${fmtN(c.litres)}</span>`).join('')}</div>`).join('')}
+    <div class="run-foot"><button class="btn" data-act="run-sheet">Copy load sheet</button>
+      ${r.status === 'done' ? '<button class="btn ghost" data-act="run-undone">Mark not done</button>' : '<button class="btn ghost" data-act="run-done">Mark done</button>'}</div>
+  </div>`;
+}
+
+function uncoveredHtml() {
+  const b = state.board;
+  const covered = new Set([
+    ...(state.planRuns || []).filter((r) => r.status === 'planned').flatMap((r) => r.plan.stops.map((st) => st.site_id)),
+    ...(state.planDrafts || []).flatMap((d) => d.stops.map((st) => st.site_id)),
+  ]);
+  const left = b.sites.filter((s) => ['overdue', 'today', 'soon'].includes(s.status) && !covered.has(s.id));
+  if (!left.length) return '';
+  return `<div class="section">${headHtml('Still needing fuel', 'Sites due within 48 hours that aren’t on a run yet.')}
+    <div class="card"><ul class="rows">${left.map((s) => `<li><div class="row" style="cursor:default"><div class="main"><div class="title">${esc(s.name)} <span class="badge ${STATUS[s.status][0]}">${STATUS[s.status][1]}</span></div>
+      <div class="meta">${s.deliver_by <= b.now + 60000 ? 'Deliver now' : `Deliver by ${esc(fmtWhen(s.deliver_by))}`}</div></div>
+      <button class="btn sm" data-act="draft-add" data-site="${s.id}">Add run</button></div></li>`).join('')}</ul></div></div>`;
+}
+
+function renderPlanBody() {
+  const drafts = state.planDrafts || [];
+  $('#plan-drafts').innerHTML = drafts.length
+    ? `${headHtml('Suggested runs', 'Not saved until you confirm them. Change a truck, stop or time and the loads are worked out again; change a compartment to override it.')}<div style="display:grid;gap:16px">${drafts.map(draftHtml).join('')}</div>`
+    : '';
+  $('#plan-left').innerHTML = uncoveredHtml();
+}
+
+async function viewPlan() {
+  const [b] = await Promise.all([api('/board'), load('trucks', true), load('sites', true), load('grades', true)]);
+  state.board = b;
+  state.planRuns = await api(`/runs?date=${b.today}`);
+  if (state.planDay !== b.today) {
+    state.planDay = b.today;
+    state.planDrafts = [];
+    state.planStart = roundUp(b.now + 2 * 3600000, 15);
+  }
+  const free = (state.cache.trucks || []).filter((t) => t.available).length;
+  const due = b.sites.filter((s) => ['overdue', 'today', 'soon'].includes(s.status)).length;
+  const runs = state.planRuns || [];
+  return headHtml('Load plans', `${esc(new Intl.DateTimeFormat('en-AU', { timeZone: 'UTC', weekday: 'long', day: 'numeric', month: 'long' }).format(new Date(b.today + 'T00:00:00Z')))} · ${plural(free, 'truck')} available · ${plural(due, 'site')} due within 48 hours`,
+    `<label class="plan-start">First drops from <input type="time" id="plan-start" value="${hhmm(state.planStart)}"></label>
+     <button class="btn" data-act="draft-blank">Add run</button><button class="btn primary" data-act="plan-suggest">Suggest runs</button>`) +
+    `<div id="plan-root">
+      ${runs.length ? `<div class="section" style="margin-top:0">${headHtml('Confirmed runs', '')}<div style="display:grid;gap:16px">${runs.map(runCardHtml).join('')}</div></div>` : ''}
+      <div id="plan-drafts" class="section"></div>
+      ${!runs.length && !(state.planDrafts || []).length ? `<div class="card" id="plan-empty">${emptyHtml('No runs yet', 'Suggest runs fills each available truck, most urgent sites first. Loads use whole compartments and stay within the room each tank will have when the truck arrives.')}</div>` : ''}
+      <div id="plan-left"></div>
+    </div>
+    <p class="muted" style="font-size:13px;margin-top:16px">Arrival times are estimates you can change. A second stop is added when there’s room left on the truck for at least ${fmtL(state.settings.min_drop_l)} at a site within 120 km. Travel between stops is estimated from straight-line distance.</p>`;
+}
+
+function wirePlan() {
+  const root = $('#plan-root');
+  if (!root) return;
+  renderPlanBody();
+  const draftOf = (el) => (state.planDrafts || []).find((d) => d.key === Number(el.closest('[data-draft]').dataset.draft));
+  const rerender = () => { const e = $('#plan-empty'); if (e) e.remove(); renderPlanBody(); };
+  $('#plan-start').onchange = (e) => {
+    if (e.target.value) state.planStart = atFromTime(state.board.today, e.target.value);
+  };
+  root.addEventListener('change', (e) => {
+    const el = e.target;
+    if (!el.closest('[data-draft]')) return;
+    const d = draftOf(el);
+    const f = el.dataset.f;
+    if (f === 'truck') { d.truck_id = Number(el.value); optimiseDraft(d); }
+    else if (f === 'site') {
+      const i = Number(el.dataset.stop);
+      if (!el.value) d.stops.splice(1);
+      else if (d.stops[i]) d.stops[i].site_id = Number(el.value);
+      else {
+        const prev = d.stops[0];
+        const sitesById = new Map((state.cache.sites || []).map((s) => [s.id, s]));
+        const km = kmBetween(sitesById.get(prev.site_id), sitesById.get(Number(el.value))) || 30;
+        d.stops.push({ site_id: Number(el.value), at: roundUp(prev.at + (45 + (km * 1.3 / 75) * 60) * 60000, 5) });
+      }
+      if (d.stops.length === 2 && d.stops[0].site_id === d.stops[1].site_id) d.stops.splice(1);
+      optimiseDraft(d);
+    } else if (f === 'at') {
+      if (el.value) d.stops[Number(el.dataset.stop)].at = atFromTime(state.board.today, el.value);
+      optimiseDraft(d);
+    } else if (f === 'comp') {
+      const c = d.comps.find((x) => x.position === Number(el.dataset.pos));
+      c.target = el.value ? { stop: Number(el.value.split(':')[0]), grade_id: Number(el.value.split(':')[1]) } : null;
+      d.manual = true;
+    }
+    rerender();
+  });
+  root.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-act]');
+    if (!btn) return;
+    const act = btn.dataset.act;
+    try {
+      if (act.startsWith('draft-') && btn.closest('[data-draft]')) {
+        const d = draftOf(btn);
+        if (act === 'draft-remove') state.planDrafts.splice(state.planDrafts.indexOf(d), 1);
+        if (act === 'draft-reset') optimiseDraft(d);
+        if (act === 'draft-sheet') return copyText(loadSheetText({ run_date: state.board.today, plan: draftToRun(d).plan }));
+        if (act === 'draft-confirm') {
+          const warns = planWarnings(d).filter((w) => /won’t fit|over .* payload/.test(w));
+          if (warns.length && btn.dataset.confirm !== '1') {
+            btn.dataset.confirm = '1';
+            btn.textContent = 'Confirm anyway';
+            toast('This run has loads that won’t fit. Check them first.');
+            return;
+          }
+          btn.disabled = true;
+          await api('/runs', { method: 'POST', body: draftToRun(d) });
+          state.planDrafts.splice(state.planDrafts.indexOf(d), 1);
+          toast('Run confirmed');
+          return render();
+        }
+        rerender();
+      } else if (act === 'draft-add') {
+        const s = state.board.sites.find((x) => x.id === Number(btn.dataset.site));
+        const busy = new Set([...(state.planRuns || []).filter((r) => r.status === 'planned').map((r) => r.truck_id), ...state.planDrafts.map((d) => d.truck_id)]);
+        const truck = (state.cache.trucks || []).filter((t) => t.available && !busy.has(t.id)).sort((x, y) => y.total_capacity_l - x.total_capacity_l)[0] ||
+          (state.cache.trucks || [])[0];
+        if (!truck) return toast('Add a truck first.');
+        state.planDrafts.push(newDraft(truck.id, [{ site_id: s.id, at: roundUp(Math.max(state.planStart, s.window_opens || 0), 5) }]));
+        rerender();
+      } else if (btn.closest('[data-run]')) {
+        const id = Number(btn.closest('[data-run]').dataset.run);
+        const run = state.planRuns.find((r) => r.id === id);
+        if (act === 'run-sheet') return copyText(loadSheetText(run));
+        if (act === 'run-done' || act === 'run-undone') {
+          await api(`/runs/${id}`, { method: 'PUT', body: { status: act === 'run-done' ? 'done' : 'planned' } });
+          return render();
+        }
+        if (act === 'run-delete') {
+          if (btn.dataset.confirm !== '1') { btn.dataset.confirm = '1'; btn.textContent = 'Tap again to delete'; return; }
+          await api(`/runs/${id}`, { method: 'DELETE' });
+          toast('Run deleted');
+          return render();
+        }
+      }
+    } catch (err) {
+      toast(err.message);
+      btn.disabled = false;
+    }
+  });
+}
+
 /* ----------------------------------------------------- auth screens */
 function authScreen(setup) {
   return `<div class="auth"><div class="card">${icon.logo}
@@ -2220,7 +2872,7 @@ async function render() {
   }
   const parts = (location.hash.replace(/^#\/?/, '') || 'board').split('/');
   const route = parts[0];
-  const views = { board: viewBoard, sales: viewSales, sites: viewSites, dips: viewDips, tanks: viewTanks, trucks: viewTrucks, grades: viewGrades, terminals: viewTerminals, drivers: viewDrivers, settings: viewSettings, import: viewImport, users: viewUsers };
+  const views = { board: viewBoard, plan: viewPlan, sales: viewSales, sites: viewSites, dips: viewDips, tanks: viewTanks, trucks: viewTrucks, grades: viewGrades, terminals: viewTerminals, drivers: viewDrivers, settings: viewSettings, import: viewImport, users: viewUsers };
   const view = route === 'sites' && parts[1] ? () => viewSite(Number(parts[1])) : views[route] || viewBoard;
   if (!$('#main')) app.innerHTML = shell(route, '');
   else $$('nav.tabs a').forEach((a) => a.classList.toggle('on', a.getAttribute('href') === '#/' + route));
@@ -2280,6 +2932,34 @@ function afterRender(route) {
   }
   if (route === 'import') wireImport();
   if (route === 'sales') wireSales();
+  if (route === 'plan') {
+    wirePlan();
+    const sug = $('[data-act=plan-suggest]');
+    if (sug) sug.onclick = () => {
+      sug.disabled = true;
+      sug.textContent = 'Working out loads…';
+      setTimeout(() => {
+        try { suggestRuns(); } catch (err) { toast(err.message); }
+        sug.disabled = false;
+        sug.textContent = 'Suggest runs';
+        const e = $('#plan-empty');
+        if (e) e.remove();
+        renderPlanBody();
+        if (!state.planDrafts.length) toast('No runs to suggest: no free trucks, or no sites due within 48 hours.');
+      }, 20);
+    };
+    const blank = $('[data-act=draft-blank]');
+    if (blank) blank.onclick = () => {
+      const b = state.board;
+      const site = b.sites.find((x) => ['overdue', 'today', 'soon'].includes(x.status)) || b.sites.find((x) => x.groups.some((g) => g.level != null));
+      const truck = (state.cache.trucks || []).find((t) => t.available) || (state.cache.trucks || [])[0];
+      if (!site || !truck) return toast('Add sites with dips and a truck first.');
+      state.planDrafts.push(newDraft(truck.id, [{ site_id: site.id, at: roundUp(Math.max(state.planStart, site.window_opens || 0), 5) }]));
+      const e = $('#plan-empty');
+      if (e) e.remove();
+      renderPlanBody();
+    };
+  }
   if (route === 'board' && $('#bq')) {
     const apply = () => {
       const term = $('#bq').value.trim().toLowerCase();

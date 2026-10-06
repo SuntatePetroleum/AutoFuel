@@ -179,6 +179,22 @@ const MIGRATIONS = [
     `ALTER TABLE settings ADD COLUMN floor_hours REAL NOT NULL DEFAULT 12`,
     `UPDATE settings SET runout_buffer_h = 0 WHERE runout_buffer_h = 12`,
   ],
+  // v4: delivery runs, confirmed from the Plan screen.
+  [
+    `CREATE TABLE IF NOT EXISTS runs (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      run_date TEXT NOT NULL,
+      truck_id INTEGER REFERENCES trucks(id) ON DELETE SET NULL,
+      driver_id INTEGER REFERENCES drivers(id) ON DELETE SET NULL,
+      status TEXT NOT NULL DEFAULT 'planned' CHECK (status IN ('planned', 'done')),
+      plan TEXT NOT NULL,
+      created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at INTEGER NOT NULL,
+      updated_at INTEGER NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_runs_company_date ON runs(company_id, run_date)`,
+  ],
 ];
 
 let schemaVersionSeen = 0;
@@ -598,7 +614,11 @@ async function deleteEntity(env, companyId, name, id) {
     run('DELETE FROM sales_daily WHERE grade_id = ? AND company_id = ?');
     run('DELETE FROM sales_items WHERE grade_id = ? AND company_id = ?');
   }
-  if (name === 'trucks') run('DELETE FROM compartments WHERE truck_id = ? AND company_id = ?');
+  if (name === 'trucks') {
+    run('DELETE FROM compartments WHERE truck_id = ? AND company_id = ?');
+    run('UPDATE runs SET truck_id = NULL WHERE truck_id = ? AND company_id = ?');
+  }
+  if (name === 'drivers') run('UPDATE runs SET driver_id = NULL WHERE driver_id = ? AND company_id = ?');
   stmts.push(env.DB.prepare(`DELETE FROM ${def.table} WHERE id = ? AND company_id = ?`).bind(id, companyId));
   await env.DB.batch(stmts);
 }
@@ -1532,7 +1552,7 @@ async function runoutBoard(env, companyId) {
           g.empty_at = whenLevel(key, fc, now, level, 0);
         }
         g.next_days = [];
-        for (let i = 0; i < 7; i++) {
+        for (let i = 0; i < 21; i++) {
           const day = shiftDay(today, i);
           g.next_days.push({ day, litres: Math.round(forecastFor(fc, day)) });
         }
@@ -1617,6 +1637,98 @@ async function runoutBoard(env, companyId) {
   };
 }
 
+/* ------------------------------------------------------------------ runs */
+
+async function listRuns(env, companyId, from, to) {
+  const { results } = await env.DB.prepare(
+    `SELECT r.id, r.run_date, r.truck_id, r.driver_id, r.status, r.plan, r.created_at, r.updated_at,
+            t.name AS truck_name, t.rego AS truck_rego, d.name AS driver_name, u.name AS created_by_name
+     FROM runs r LEFT JOIN trucks t ON t.id = r.truck_id LEFT JOIN drivers d ON d.id = r.driver_id
+     LEFT JOIN users u ON u.id = r.created_by
+     WHERE r.company_id = ? AND r.run_date BETWEEN ? AND ? ORDER BY r.run_date, r.id`
+  )
+    .bind(companyId, from, to)
+    .all();
+  return results.map((r) => ({ ...r, plan: JSON.parse(r.plan) }));
+}
+
+// A run: one truck, one to three stops, and what goes in each compartment. Names are
+// saved with the run so its load sheet still reads right if setup data changes later.
+async function saveRun(request, env, me) {
+  const body = await readJson(request);
+  const cid = me.company_id;
+  const runDate = String(body.run_date || '');
+  if (!DAY_RE.test(runDate)) throw new HttpError(400, 'Choose the day of the run.');
+  const truckId = coerce('truck', { type: 'ref', required: true, label: 'Truck' }, body.truck_id);
+  const truck = await env.DB.prepare('SELECT id, name, rego FROM trucks WHERE id = ? AND company_id = ?').bind(truckId, cid).first();
+  if (!truck) throw new HttpError(400, 'That truck was not found.');
+  let driver = null;
+  if (body.driver_id != null && body.driver_id !== '') {
+    const driverId = coerce('driver', { type: 'ref', label: 'Driver' }, body.driver_id);
+    driver = await env.DB.prepare('SELECT id, name FROM drivers WHERE id = ? AND company_id = ?').bind(driverId, cid).first();
+    if (!driver) throw new HttpError(400, 'That driver was not found.');
+  }
+  const plan = body.plan || {};
+  const stopsIn = Array.isArray(plan.stops) ? plan.stops : [];
+  if (!stopsIn.length || stopsIn.length > 3) throw new HttpError(400, 'A run needs one to three stops.');
+  const { results: siteRows } = await env.DB.prepare('SELECT id, name FROM sites WHERE company_id = ?').bind(cid).all();
+  const { results: gradeRows } = await env.DB.prepare('SELECT id, code FROM grades WHERE company_id = ?').bind(cid).all();
+  const { results: compRows } = await env.DB.prepare('SELECT position, capacity_l FROM compartments WHERE truck_id = ? AND company_id = ?').bind(truckId, cid).all();
+  const sitesById = new Map(siteRows.map((r) => [r.id, r]));
+  const gradesById = new Map(gradeRows.map((r) => [r.id, r]));
+  const compByPos = new Map(compRows.map((r) => [r.position, r.capacity_l]));
+  const stops = stopsIn.map((st, i) => {
+    const site = sitesById.get(Number(st.site_id));
+    if (!site) throw new HttpError(400, `Stop ${i + 1}: that site was not found.`);
+    const at = Number(st.at);
+    if (!Number.isFinite(at) || Math.abs(at - Date.now()) > 8 * 86400000) throw new HttpError(400, `Stop ${i + 1}: the arrival time isn’t valid.`);
+    return { site_id: site.id, site_name: site.name, at };
+  });
+  if (new Set(stops.map((st) => st.site_id)).size !== stops.length) throw new HttpError(400, 'A site appears twice in this run.');
+  const comps = (Array.isArray(plan.compartments) ? plan.compartments : []).map((c) => {
+    const position = Number(c.position);
+    const cap = compByPos.get(position);
+    if (!cap) throw new HttpError(400, `${truck.name} has no compartment ${c.position}.`);
+    const stop = Number(c.stop);
+    if (!Number.isInteger(stop) || !stops[stop]) throw new HttpError(400, `Compartment ${position} goes to a stop that isn’t in the run.`);
+    const grade = gradesById.get(Number(c.grade_id));
+    if (!grade) throw new HttpError(400, `Compartment ${position}: that grade was not found.`);
+    const litres = Math.round(Number(c.litres));
+    if (!(litres > 0) || litres > cap) throw new HttpError(400, `Compartment ${position} holds at most ${cap.toLocaleString('en-AU')} L.`);
+    return { position, capacity: cap, litres, stop, site_id: stops[stop].site_id, grade_id: grade.id, grade_code: grade.code };
+  });
+  if (!comps.length) throw new HttpError(400, 'Put fuel in at least one compartment.');
+  if (new Set(comps.map((c) => c.position)).size !== comps.length) throw new HttpError(400, 'A compartment appears twice.');
+  comps.sort((a, b) => a.position - b.position);
+  const stored = JSON.stringify({ truck_name: truck.name, truck_rego: truck.rego, driver_name: driver ? driver.name : null, stops, compartments: comps });
+  const now = Date.now();
+  const row = await env.DB.prepare(
+    `INSERT INTO runs (company_id, run_date, truck_id, driver_id, status, plan, created_by, created_at, updated_at)
+     VALUES (?, ?, ?, ?, 'planned', ?, ?, ?, ?) RETURNING id`
+  )
+    .bind(cid, runDate, truckId, driver ? driver.id : null, stored, me.id, now, now)
+    .first();
+  const [saved] = (await listRuns(env, cid, runDate, runDate)).filter((r) => r.id === row.id);
+  return json(saved, 201);
+}
+
+async function updateRun(request, env, me, id) {
+  const body = await readJson(request);
+  const status = coerce('status', { type: 'text', required: true, options: ['planned', 'done'], label: 'Status' }, body.status);
+  const res = await env.DB.prepare('UPDATE runs SET status = ?, updated_at = ? WHERE id = ? AND company_id = ? RETURNING run_date')
+    .bind(status, Date.now(), id, me.company_id)
+    .first();
+  if (!res) throw new HttpError(404, 'That run was not found.');
+  return json({ ok: true });
+}
+
+async function deleteRun(env, me, id) {
+  const row = await env.DB.prepare('SELECT id FROM runs WHERE id = ? AND company_id = ?').bind(id, me.company_id).first();
+  if (!row) throw new HttpError(404, 'That run was not found.');
+  await env.DB.prepare('DELETE FROM runs WHERE id = ? AND company_id = ?').bind(id, me.company_id).run();
+  return json({ ok: true });
+}
+
 /* ---------------------------------------------------------------- router */
 
 async function handleApi(request, env, url) {
@@ -1660,6 +1772,18 @@ async function handleApi(request, env, url) {
     requireAdmin();
     return saveSalesItems(request, env, me);
   }
+
+  // Runs: admins and dispatchers plan them.
+  if (path === '/api/runs' && method === 'GET') {
+    const from = url.searchParams.get('from') || url.searchParams.get('date');
+    const to = url.searchParams.get('to') || from;
+    if (!DAY_RE.test(from || '') || !DAY_RE.test(to || '')) throw new HttpError(400, 'Choose a day.');
+    return json(await listRuns(env, me.company_id, from, to));
+  }
+  if (path === '/api/runs' && method === 'POST') return saveRun(request, env, me);
+  const runMatch = path.match(/^\/api\/runs\/(\d+)$/);
+  if (runMatch && method === 'PUT') return updateRun(request, env, me, Number(runMatch[1]));
+  if (runMatch && method === 'DELETE') return deleteRun(env, me, Number(runMatch[1]));
 
   // Dips: admins and dispatchers can read and record them.
   if (path === '/api/dips/latest' && method === 'GET') return json(await latestDips(env, me.company_id));
