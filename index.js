@@ -213,6 +213,43 @@ const MIGRATIONS = [
     `UPDATE grades SET density = 0.77 WHERE code = 'ULP98' AND density = 0.75`,
     `UPDATE grades SET density = 0.85 WHERE code IN ('DSL', 'PDSL') AND density = 0.835`,
   ],
+  // v6: the sales feed (reports emailed or posted in, waiting to be read) and deliveries
+  // recorded when a run is done, so levels carry on between dips.
+  [
+    `CREATE TABLE IF NOT EXISTS inbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      received_at INTEGER NOT NULL,
+      via TEXT NOT NULL DEFAULT 'email',
+      sender TEXT,
+      subject TEXT,
+      filename TEXT NOT NULL,
+      content_type TEXT,
+      size INTEGER,
+      data TEXT,
+      status TEXT NOT NULL DEFAULT 'new' CHECK (status IN ('new', 'processing', 'imported', 'attention', 'failed')),
+      note TEXT,
+      claimed_at INTEGER,
+      processed_at INTEGER
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_inbox_company ON inbox(company_id, status, received_at)`,
+    `CREATE TABLE IF NOT EXISTS deliveries (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      run_id INTEGER REFERENCES runs(id) ON DELETE CASCADE,
+      site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+      grade_id INTEGER NOT NULL REFERENCES grades(id) ON DELETE CASCADE,
+      litres REAL NOT NULL,
+      delivered_at INTEGER NOT NULL,
+      entered_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      created_at INTEGER NOT NULL
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_deliveries_company_time ON deliveries(company_id, delivered_at)`,
+    `ALTER TABLE settings ADD COLUMN feed_token TEXT`,
+    `ALTER TABLE settings ADD COLUMN feed_senders TEXT`,
+    `ALTER TABLE settings ADD COLUMN feed_domain TEXT`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_settings_feed_token ON settings(feed_token)`,
+  ],
 ];
 
 let schemaVersionSeen = 0;
@@ -273,6 +310,13 @@ function b64(bytes) {
 
 function unb64(str) {
   return Uint8Array.from(atob(str), (c) => c.charCodeAt(0));
+}
+
+// Base64 for files, a chunk at a time so big files stay quick.
+function b64Big(bytes) {
+  let s = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  return btoa(s);
 }
 
 async function sha256Hex(text) {
@@ -671,11 +715,13 @@ async function deleteEntity(env, companyId, name, id) {
     run('DELETE FROM dips WHERE tank_id IN (SELECT id FROM tanks WHERE site_id = ?) AND company_id = ?');
     run('DELETE FROM tanks WHERE site_id = ? AND company_id = ?');
     run('DELETE FROM sales_daily WHERE site_id = ? AND company_id = ?');
+    run('DELETE FROM deliveries WHERE site_id = ? AND company_id = ?');
   }
   if (name === 'tanks') run('DELETE FROM dips WHERE tank_id = ? AND company_id = ?');
   if (name === 'grades') {
     run('DELETE FROM sales_daily WHERE grade_id = ? AND company_id = ?');
     run('DELETE FROM sales_items WHERE grade_id = ? AND company_id = ?');
+    run('DELETE FROM deliveries WHERE grade_id = ? AND company_id = ?');
   }
   if (name === 'trucks') {
     run('DELETE FROM compartments WHERE truck_id = ? AND company_id = ?');
@@ -1156,7 +1202,7 @@ function cleanLitres(raw, label) {
 
 async function companyTanks(env, companyId) {
   const { results } = await env.DB.prepare(
-    `SELECT t.id, t.name, t.capacity_l, t.active, s.name AS site_name, g.code AS grade_code
+    `SELECT t.id, t.name, t.capacity_l, t.active, t.site_id, t.grade_id, s.name AS site_name, g.code AS grade_code
      FROM tanks t JOIN sites s ON s.id = t.site_id JOIN grades g ON g.id = t.grade_id WHERE t.company_id = ?`
   )
     .bind(companyId)
@@ -1530,6 +1576,12 @@ async function runoutBoard(env, companyId) {
     .bind(companyId, from)
     .all();
   const dipOf = new Map(latest.map((d) => [d.tank_id, d]));
+  // Deliveries recorded since the oldest dip, from runs marked done.
+  const { results: delivered } = await env.DB.prepare(
+    'SELECT site_id, grade_id, litres, delivered_at FROM deliveries WHERE company_id = ? AND delivered_at >= ?'
+  )
+    .bind(companyId, latest.length ? Math.min(...latest.map((d) => d.taken_at)) : now)
+    .all();
   const hist = new Map();
   const gradeInfo = new Map();
   for (const s of sales) {
@@ -1605,14 +1657,19 @@ async function runoutBoard(env, companyId) {
       };
       g.state = !fc ? 'no_sales' : g.tanks.some((t) => !t.dip) ? 'no_dip' : avg <= 0 ? 'no_recent_sales' : 'ok';
       if (g.tanks.every((t) => t.dip)) {
-        // Each tank of the grade sells its share by capacity, from its own dip time.
+        // Each tank of the grade sells its share by capacity, from its own dip time, and
+        // takes its share of any delivery made since then.
+        const drops = delivered.filter((d) => d.site_id === site.id && d.grade_id === gradeId);
         let level = 0;
         let soldActual = 0;
         let soldForecast = 0;
+        let deliveredSince = 0;
         for (const t of g.tanks) {
           const share = capacity ? t.capacity / capacity : 1;
           const sold = soldBetween(key, fc, t.dip.at, now) * share;
-          level += t.dip.litres - sold;
+          const into = drops.filter((d) => d.delivered_at > t.dip.at).reduce((a, d) => a + d.litres, 0) * share;
+          deliveredSince += into;
+          level += t.dip.litres - sold + into;
           const actualTo = fc ? startOf(shiftDay(fc.last, 1)) : t.dip.at;
           const a = soldBetween(key, fc, t.dip.at, Math.min(now, Math.max(t.dip.at, actualTo))) * share;
           soldActual += a;
@@ -1622,6 +1679,7 @@ async function runoutBoard(env, companyId) {
         g.dip_at = Math.min(...g.tanks.map((t) => t.dip.at));
         g.sold_since_dip = Math.round(soldActual + soldForecast);
         g.sold_since_dip_estimated = Math.round(soldForecast);
+        g.delivered_since_dip = Math.round(deliveredSince);
         g.level = Math.max(0, Math.round(level));
         g.room_now = Math.max(0, g.fill_to - g.level);
         if (g.state === 'ok') {
@@ -1726,7 +1784,13 @@ async function listRuns(env, companyId, from, to) {
   )
     .bind(companyId, from, to)
     .all();
-  return results.map((r) => ({ ...r, plan: JSON.parse(r.plan) }));
+  const { results: drops } = await env.DB.prepare(
+    `SELECT run_id, site_id, grade_id, litres, delivered_at FROM deliveries
+     WHERE company_id = ? AND run_id IN (SELECT id FROM runs WHERE company_id = ? AND run_date BETWEEN ? AND ?)`
+  )
+    .bind(companyId, companyId, from, to)
+    .all();
+  return results.map((r) => ({ ...r, plan: JSON.parse(r.plan), delivered: drops.filter((d) => d.run_id === r.id) }));
 }
 
 // A run: one truck, one to three stops, and what goes in each compartment. Names are
@@ -1813,14 +1877,305 @@ async function updateRun(request, env, me, id) {
     .bind(status, Date.now(), id, me.company_id)
     .first();
   if (!res) throw new HttpError(404, 'That run was not found.');
+  // Back to planned: what it delivered no longer counts. Dips taken stay, as real readings.
+  if (status === 'planned') await env.DB.prepare('DELETE FROM deliveries WHERE run_id = ? AND company_id = ?').bind(id, me.company_id).run();
   return json({ ok: true });
+}
+
+// A run marked done: the litres that went into each site's grades (from the load, or as
+// changed from the docket), and any dips taken after the drop. Until the next dip, the
+// board adds these deliveries to the level.
+async function completeRun(request, env, me, id) {
+  const body = await readJson(request);
+  const cid = me.company_id;
+  const run = await env.DB.prepare('SELECT id, plan FROM runs WHERE id = ? AND company_id = ?').bind(id, cid).first();
+  if (!run) throw new HttpError(404, 'That run was not found.');
+  const plan = JSON.parse(run.plan);
+  const stopsIn = Array.isArray(body.stops) ? body.stops : [];
+  if (stopsIn.length > 3) throw new HttpError(400, 'A run has at most three stops.');
+  const tanks = new Map((await companyTanks(env, cid)).map((t) => [t.id, t]));
+  const { results: gradeRows } = await env.DB.prepare('SELECT id, code FROM grades WHERE company_id = ?').bind(cid).all();
+  const grades = new Map(gradeRows.map((g) => [g.id, g]));
+  const now = Date.now();
+  const stmts = [env.DB.prepare('DELETE FROM deliveries WHERE run_id = ? AND company_id = ?').bind(id, cid)];
+  const warnings = [];
+  for (const st of stopsIn) {
+    const stop = plan.stops.find((p) => p.site_id === Number(st.site_id));
+    if (!stop) throw new HttpError(400, 'A stop isn’t part of this run.');
+    const at = Number(st.at);
+    if (!Number.isFinite(at)) throw new HttpError(400, `${stop.site_name}: choose when it was delivered.`);
+    if (at > now + 15 * 60000) throw new HttpError(400, `${stop.site_name}: the delivery time is in the future.`);
+    if (at < now - 14 * 86400000) throw new HttpError(400, `${stop.site_name}: the delivery time is more than two weeks ago.`);
+    for (const g of Array.isArray(st.grades) ? st.grades : []) {
+      const grade = grades.get(Number(g.grade_id));
+      if (!grade) throw new HttpError(400, `${stop.site_name}: that grade was not found.`);
+      const litres = Number(g.litres);
+      if (!Number.isFinite(litres) || litres < 0 || litres > 200000) throw new HttpError(400, `${stop.site_name} ${grade.code}: enter the litres delivered.`);
+      if (litres > 0) {
+        stmts.push(
+          env.DB.prepare(
+            'INSERT INTO deliveries (company_id, run_id, site_id, grade_id, litres, delivered_at, entered_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+          ).bind(cid, id, stop.site_id, grade.id, Math.round(litres), at, me.id, now)
+        );
+      }
+    }
+    for (const d of Array.isArray(st.dips) ? st.dips : []) {
+      if (d.litres === null || d.litres === undefined || String(d.litres).trim() === '') continue;
+      const tank = tanks.get(Number(d.tank_id));
+      if (!tank || tank.site_id !== stop.site_id) throw new HttpError(400, `${stop.site_name}: one of those tanks isn’t at this site.`);
+      const litres = cleanLitres(d.litres, `${stop.site_name} ${tank.name}`);
+      const warning = overCapacity(tank, litres);
+      if (warning) warnings.push(warning);
+      // Taken just after the drop, so it replaces the delivery in the level.
+      stmts.push(saveDip(env, cid, me.id, tank.id, litres, Math.min(at + 60000, now + 60000), 'delivery'));
+    }
+  }
+  stmts.push(env.DB.prepare("UPDATE runs SET status = 'done', updated_at = ? WHERE id = ? AND company_id = ?").bind(now, id, cid));
+  await env.DB.batch(stmts);
+  return json({ ok: true, warnings });
 }
 
 async function deleteRun(env, me, id) {
   const row = await env.DB.prepare('SELECT id FROM runs WHERE id = ? AND company_id = ?').bind(id, me.company_id).first();
   if (!row) throw new HttpError(404, 'That run was not found.');
-  await env.DB.prepare('DELETE FROM runs WHERE id = ? AND company_id = ?').bind(id, me.company_id).run();
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM deliveries WHERE run_id = ? AND company_id = ?').bind(id, me.company_id),
+    env.DB.prepare('DELETE FROM runs WHERE id = ? AND company_id = ?').bind(id, me.company_id),
+  ]);
   return json({ ok: true });
+}
+
+/* ------------------------------------------------------------ sales feed */
+// Sales reports can come in without anyone uploading them. The point-of-sale emails them
+// to the company's feed address (sales-<token>@<domain>, delivered to this Worker by
+// Cloudflare Email Routing), or a script posts them to the upload address. Each file waits
+// in the inbox until the app is next opened, where it's read with the same readers as an
+// upload, so the Worker itself does very little work per email.
+
+const FEED_FILES = /\.(pdf|xlsx)$/i;
+const FEED_MAX_B64 = 1_900_000; // D1 rows stay under 2 MB
+const FEED_KEEP_DAYS = 90;
+
+function newFeedToken() {
+  const letters = 'abcdefghijkmnpqrstuvwxyz23456789';
+  return [...crypto.getRandomValues(new Uint8Array(12))].map((b) => letters[b % 32]).join('');
+}
+
+async function feedSettings(env, companyId) {
+  const s = await getSettings(env, companyId);
+  if (s.feed_token) return s;
+  await env.DB.prepare('UPDATE settings SET feed_token = ? WHERE company_id = ? AND feed_token IS NULL').bind(newFeedToken(), companyId).run();
+  return getSettings(env, companyId);
+}
+
+const feedDomain = (env, s) => String(env.FEED_EMAIL_DOMAIN || s.feed_domain || '').trim().toLowerCase() || null;
+
+async function feedInfo(env, companyId, origin) {
+  const s = await feedSettings(env, companyId);
+  const domain = feedDomain(env, s);
+  const { results } = await env.DB.prepare(
+    `SELECT id, received_at, via, sender, subject, filename, size, status, note, processed_at FROM inbox
+     WHERE company_id = ? ORDER BY received_at DESC, id DESC LIMIT 60`
+  )
+    .bind(companyId)
+    .all();
+  return {
+    token: s.feed_token,
+    domain,
+    domain_fixed: !!env.FEED_EMAIL_DOMAIN,
+    address: domain ? `sales-${s.feed_token}@${domain}` : null,
+    senders: s.feed_senders || '',
+    upload_url: `${origin}/api/feed/upload/${s.feed_token}`,
+    files: results,
+  };
+}
+
+async function updateFeed(request, env, me) {
+  const body = await readJson(request);
+  const sets = [];
+  const params = [];
+  if ('domain' in body) {
+    const d = String(body.domain || '').trim().toLowerCase().replace(/^.*@/, '');
+    if (d && !/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(d)) throw new HttpError(400, 'Enter a domain like reports.example.com.');
+    sets.push('feed_domain = ?');
+    params.push(d || null);
+  }
+  if ('senders' in body) {
+    const list = String(body.senders || '').split(/[\s,;]+/).map((x) => x.trim().toLowerCase()).filter(Boolean);
+    if (list.length > 20) throw new HttpError(400, 'List at most 20 senders.');
+    for (const x of list) {
+      if (!/^[^@\s]*@[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(x)) throw new HttpError(400, `“${x}” isn’t an email address, or a domain like @example.com.`);
+    }
+    sets.push('feed_senders = ?');
+    params.push(list.join(', ') || null);
+  }
+  if (body.new_token) {
+    sets.push('feed_token = ?');
+    params.push(newFeedToken());
+  }
+  await feedSettings(env, me.company_id);
+  if (sets.length) await env.DB.prepare(`UPDATE settings SET ${sets.join(', ')} WHERE company_id = ?`).bind(...params, me.company_id).run();
+  return json(await feedInfo(env, me.company_id, new URL(request.url).origin));
+}
+
+function feedFileStmt(env, companyId, f) {
+  const tooBig = f.data && f.data.length > FEED_MAX_B64;
+  const usable = FEED_FILES.test(f.filename);
+  const status = f.status || (!usable || tooBig ? 'failed' : 'new');
+  const note = f.note || (!usable ? 'Not a PDF or Excel (.xlsx) file, so it was skipped.' : tooBig ? 'Too large to keep (over about 1.4 MB).' : null);
+  return env.DB.prepare(
+    `INSERT INTO inbox (company_id, received_at, via, sender, subject, filename, content_type, size, data, status, note)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+  ).bind(companyId, Date.now(), f.via, f.sender || null, f.subject || null, f.filename.slice(0, 200), f.content_type || null,
+    f.data ? Math.floor((f.data.length * 3) / 4) : 0, status === 'new' ? f.data : null, status, note);
+}
+
+// Hands the next few waiting files to the app to read. A file someone started reading more
+// than ten minutes ago without finishing goes round again.
+async function claimFeed(env, companyId) {
+  const now = Date.now();
+  await env.DB.prepare('DELETE FROM inbox WHERE company_id = ? AND received_at < ?').bind(companyId, now - FEED_KEEP_DAYS * 86400000).run();
+  const { results } = await env.DB.prepare(
+    `UPDATE inbox SET status = 'processing', claimed_at = ?
+     WHERE id IN (SELECT id FROM inbox WHERE company_id = ? AND (status = 'new' OR (status = 'processing' AND claimed_at < ?))
+                  ORDER BY received_at, id LIMIT 20)
+     RETURNING id, received_at, sender, subject, filename, content_type, data`
+  )
+    .bind(now, companyId, now - 10 * 60000)
+    .all();
+  return results.sort((a, b) => a.received_at - b.received_at || a.id - b.id);
+}
+
+async function feedResults(request, env, me) {
+  const body = await readJson(request);
+  const list = Array.isArray(body.results) ? body.results.slice(0, 100) : [];
+  const now = Date.now();
+  const stmts = list.map((r) => {
+    const status = coerce('status', { type: 'text', required: true, options: ['imported', 'attention', 'failed', 'new'], label: 'Status' }, r.status);
+    return env.DB.prepare('UPDATE inbox SET status = ?, note = ?, processed_at = ? WHERE id = ? AND company_id = ?')
+      .bind(status, r.note == null ? null : String(r.note).slice(0, 500), now, Number(r.id), me.company_id);
+  });
+  if (stmts.length) await env.DB.batch(stmts);
+  return json({ ok: true });
+}
+
+// A file posted by a script: POST the file's bytes to the upload address with ?name=file.pdf.
+async function feedUpload(request, env, token, url) {
+  const s = await env.DB.prepare('SELECT company_id FROM settings WHERE feed_token = ?').bind(token).first();
+  if (!s) throw new HttpError(404, 'That upload address isn’t in use.');
+  const name = String(url.searchParams.get('name') || request.headers.get('x-filename') || '').trim().replace(/[\\/]/g, '_').slice(0, 200);
+  if (!FEED_FILES.test(name)) throw new HttpError(400, 'Add the file name to the address, like ?name=Monkland.pdf (PDF or .xlsx).');
+  const bytes = new Uint8Array(await request.arrayBuffer());
+  if (!bytes.length) throw new HttpError(400, 'The file is empty.');
+  if (bytes.length > 1_400_000) throw new HttpError(413, 'That file is too large.');
+  await feedFileStmt(env, s.company_id, { via: 'upload', filename: name, content_type: request.headers.get('content-type'), data: b64Big(bytes) }).run();
+  return json({ ok: true });
+}
+
+// --- reading an email: just enough MIME to find the attachments.
+function mimeSplit(part) {
+  const m = part.match(/\r?\n\r?\n/);
+  const head = m ? part.slice(0, m.index) : part;
+  const body = m ? part.slice(m.index + m[0].length) : '';
+  const headers = {};
+  for (const line of head.replace(/\r?\n[ \t]+/g, ' ').split(/\r?\n/)) {
+    const k = line.indexOf(':');
+    if (k > 0) headers[line.slice(0, k).trim().toLowerCase()] = line.slice(k + 1).trim();
+  }
+  return { headers, body };
+}
+
+// A header parameter such as filename="x.pdf", including the filename*=UTF-8''... form.
+function mimeParam(value, name) {
+  if (!value) return null;
+  const parts = [];
+  let plain = null;
+  for (const m of value.matchAll(/;\s*([a-z0-9_.-]+?)(\*\d+)?(\*)?\s*=\s*(?:"((?:[^"\\]|\\.)*)"|([^;\s]*))/gi)) {
+    if (m[1].toLowerCase() !== name) continue;
+    const v = m[4] !== undefined ? m[4].replace(/\\(.)/g, '$1') : m[5];
+    if (m[2] || m[3]) parts.push({ n: m[2] ? Number(m[2].slice(1)) : 0, v, encoded: !!m[3] });
+    else plain = v;
+  }
+  if (!parts.length) return plain;
+  parts.sort((a, b) => a.n - b.n);
+  let out = parts.map((p) => p.v).join('');
+  if (parts[0].encoded) {
+    out = out.replace(/^[^']*'[^']*'/, '');
+    try { out = decodeURIComponent(out); } catch { /* keep it as it is */ }
+  }
+  return out;
+}
+
+// =?UTF-8?B?...?= and =?UTF-8?Q?...?= words in subjects and file names.
+function mimeWords(text) {
+  return String(text || '').replace(/\?=\s+=\?/g, '?==?').replace(/=\?([^?]+)\?([bq])\?([^?]*)\?=/gi, (all, charset, kind, data) => {
+    try {
+      const raw = kind.toLowerCase() === 'b'
+        ? atob(data)
+        : data.replace(/_/g, ' ').replace(/=([0-9a-f]{2})/gi, (x, h) => String.fromCharCode(parseInt(h, 16)));
+      const bytes = Uint8Array.from(raw, (c) => c.charCodeAt(0));
+      return /utf-?8/i.test(charset) ? new TextDecoder().decode(bytes) : raw;
+    } catch {
+      return all;
+    }
+  });
+}
+
+function mimeAttachments(text, depth = 0) {
+  const { headers, body } = mimeSplit(text);
+  const type = headers['content-type'] || 'text/plain';
+  if (depth < 6 && /^multipart\//i.test(type)) {
+    const boundary = mimeParam(type, 'boundary');
+    if (!boundary) return [];
+    const pieces = body.split('--' + boundary);
+    const out = [];
+    for (let i = 1; i < pieces.length; i++) {
+      if (pieces[i].startsWith('--')) break;
+      out.push(...mimeAttachments(pieces[i].replace(/^[ \t]*\r?\n/, ''), depth + 1));
+    }
+    return out;
+  }
+  if (depth < 6 && /^message\/rfc822/i.test(type)) return mimeAttachments(body, depth + 1);
+  const name = mimeParam(headers['content-disposition'], 'filename') || mimeParam(type, 'name');
+  if (!name) return [];
+  const encoding = (headers['content-transfer-encoding'] || '').toLowerCase();
+  let data;
+  if (encoding === 'base64') data = body.replace(/[^A-Za-z0-9+/=]/g, '');
+  else {
+    const raw = encoding === 'quoted-printable'
+      ? body.replace(/=\r?\n/g, '').replace(/=([0-9A-Fa-f]{2})/g, (x, h) => String.fromCharCode(parseInt(h, 16)))
+      : body;
+    data = b64Big(/[^\x00-\xff]/.test(raw) ? new TextEncoder().encode(raw) : Uint8Array.from(raw, (c) => c.charCodeAt(0)));
+  }
+  return [{ filename: mimeWords(name).replace(/[\\/]/g, '_').trim(), content_type: type.split(';')[0].trim().toLowerCase(), data }];
+}
+
+// An email sent to a feed address. Unknown addresses and unapproved senders are bounced,
+// so whoever set up the schedule finds out.
+async function receiveEmail(message, env) {
+  await ensureSchema(env);
+  const to = String(message.to || '').toLowerCase();
+  const m = to.split('@')[0].match(/^sales[-_.+]([a-z0-9]{8,40})$/);
+  const s = m ? await env.DB.prepare('SELECT company_id, feed_senders FROM settings WHERE feed_token = ?').bind(m[1]).first() : null;
+  if (!s) return message.setReject('There’s no sales feed at this address.');
+  const from = String(message.from || '').toLowerCase();
+  const fromHeader = String(message.headers.get('from') || '').toLowerCase();
+  if (s.feed_senders) {
+    const allowed = s.feed_senders.split(/[\s,;]+/).filter(Boolean);
+    const addresses = [from, ...(fromHeader.match(/[^\s<>"',;]+@[^\s<>"',;]+/g) || [])];
+    if (!addresses.some((a) => allowed.some((x) => (x.startsWith('@') ? a.endsWith(x) : a === x)))) {
+      return message.setReject('This sales feed only accepts reports from approved senders.');
+    }
+  }
+  if (message.rawSize > 20 * 1024 * 1024) return message.setReject('That email is too large for the sales feed.');
+  const raw = await new Response(message.raw).text();
+  const subject = mimeWords(message.headers.get('subject') || '').slice(0, 200);
+  const files = mimeAttachments(raw).slice(0, 40);
+  const base = { via: 'email', sender: (fromHeader.match(/[^\s<>"',;]+@[^\s<>"',;]+/) || [from])[0], subject };
+  const stmts = files.length
+    ? files.map((f) => feedFileStmt(env, s.company_id, { ...base, ...f }))
+    : [feedFileStmt(env, s.company_id, { ...base, filename: '(no attachment)', status: 'failed', note: 'The email had no attachments.' })];
+  await env.DB.batch(stmts);
 }
 
 /* ---------------------------------------------------------------- router */
@@ -1836,6 +2191,10 @@ async function handleApi(request, env, url) {
   if (path === '/api/setup' && method === 'POST') return firstRunSetup(request, env);
   if (path === '/api/login' && method === 'POST') return login(request, env);
   if (path === '/api/logout' && method === 'POST') return logout(request, env);
+
+  // Sales reports posted by a script: the address itself is the key.
+  const feedPost = path.match(/^\/api\/feed\/upload\/([a-z0-9]{8,40})$/);
+  if (feedPost && method === 'POST') return feedUpload(request, env, feedPost[1], url);
 
   const me = await currentUser(request, env);
   if (!me) throw new HttpError(401, 'Please sign in.');
@@ -1877,6 +2236,23 @@ async function handleApi(request, env, url) {
   if (path === '/api/runs' && method === 'POST') return saveRun(request, env, me);
   const runMatch = path.match(/^\/api\/runs\/(\d+)$/);
   if (runMatch && method === 'PUT') return updateRun(request, env, me, Number(runMatch[1]));
+  const runDone = path.match(/^\/api\/runs\/(\d+)\/complete$/);
+  if (runDone && method === 'POST') return completeRun(request, env, me, Number(runDone[1]));
+
+  // The sales feed: anyone who can upload sales can read what's come in; admins set it up.
+  if (path === '/api/feed' && method === 'GET') return json(await feedInfo(env, me.company_id, url.origin));
+  if (path === '/api/feed' && method === 'PUT') {
+    requireAdmin();
+    return updateFeed(request, env, me);
+  }
+  if (path === '/api/feed/claim' && method === 'POST') return json(await claimFeed(env, me.company_id));
+  if (path === '/api/feed/results' && method === 'PUT') return feedResults(request, env, me);
+  const feedFile = path.match(/^\/api\/feed\/files\/(\d+)$/);
+  if (feedFile && method === 'GET') {
+    const f = await env.DB.prepare('SELECT id, filename, content_type, data, status FROM inbox WHERE id = ? AND company_id = ?').bind(Number(feedFile[1]), me.company_id).first();
+    if (!f || !f.data) throw new HttpError(404, 'That file isn’t kept any more.');
+    return json(f);
+  }
   if (runMatch && method === 'DELETE') return deleteRun(env, me, Number(runMatch[1]));
 
   // Dips: admins and dispatchers can read and record them.
@@ -1947,6 +2323,15 @@ export default {
       if (err instanceof HttpError) return json({ error: err.message }, err.status);
       console.error(err);
       return json({ error: 'Something went wrong on the server. Try again, and tell your admin if it keeps happening.' }, 500);
+    }
+  },
+  // Sales reports emailed to a feed address (see the sales feed section).
+  async email(message, env) {
+    try {
+      await receiveEmail(message, env);
+    } catch (err) {
+      console.error(err);
+      message.setReject('The sales feed couldn’t take this email just now. Try again later.');
     }
   },
 };

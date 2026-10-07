@@ -138,6 +138,15 @@
   .plan-table .sub { display: block; font-size: 11px; color: var(--muted); }
   .run-weight { display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 0 16px 12px; font-size: 13px; color: var(--muted); }
   .run-weight strong { color: var(--text); }
+  .feed-address { font-family: var(--mono); font-size: 14px; word-break: break-all; background: var(--surface-2); padding: 6px 10px; border-radius: 8px; }
+  .feed-steps { margin: 0; padding-left: 20px; font-size: 14px; }
+  .feed-steps li + li { margin-top: 6px; }
+  .feed-files td { vertical-align: top; overflow-wrap: anywhere; }
+  .feed-files td.n { white-space: nowrap; }
+  .feed-files .sub, .deliver .sub { display: block; font-size: 12px; color: var(--muted); }
+  .deliver td .suffix { display: flex; align-items: center; gap: 6px; justify-content: flex-end; }
+  .deliver td .suffix input { width: 110px; text-align: right; }
+  .deliver h3 { margin: 0 0 8px; font-size: 15px; }
   .run-comp.part span { color: var(--warn); }
   .run-comps { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px 10px; padding: 12px 16px; border-top: 1px solid var(--border); }
   .run-comp { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
@@ -1207,7 +1216,7 @@ async function dipHistoryDialog(tankId) {
   const t = tanks.find((x) => x.id === tankId);
   if (!t) return;
   const rows = await api('/dips?tank=' + tankId);
-  const who = (d) => [d.entered_by_name, d.source === 'upload' ? 'uploaded' : d.source === 'driver' ? 'driver' : null].filter(Boolean).join(', ');
+  const who = (d) => [d.entered_by_name, d.source === 'upload' ? 'uploaded' : d.source === 'driver' ? 'driver' : d.source === 'delivery' ? 'after delivery' : null].filter(Boolean).join(', ');
   openDialog({
     title: `${t.site_name} · ${t.name}`,
     sub: `${t.grade_code} · capacity ${fmtL(t.capacity_l)}`,
@@ -2001,6 +2010,7 @@ function boardGradeDialog(siteId, gradeId) {
     body = `<dl class="details" style="margin:0">
         ${row(g.tanks.length > 1 ? 'Latest dips' : 'Latest dip', dips)}
         ${row('Sold since', `${fmtL(g.sold_since_dip)}${g.sold_since_dip_estimated ? `<div class="hint">${fmtL(g.sold_since_dip_estimated)} of it estimated${g.sales_to ? `, as sales after ${esc(fmtDayShort(g.sales_to))} aren’t uploaded yet` : ''}</div>` : ''}`)}
+        ${g.delivered_since_dip ? row('Delivered since', `${fmtL(g.delivered_since_dip)}<div class="hint">From runs marked done. The next dip replaces this.</div>`) : ''}
         ${row('Estimated now', `${fmtL(g.level)} (${pct(g.level, g.capacity)}%)`)}
         ${row('Capacity', fmtL(g.capacity))}
         ${row('Fills to', `${fmtL(g.fill_to)}<div class="hint">${Math.round(st.safe_fill_pct * 100)}% of capacity, less ${fmtL(st.overfill_margin_l)} margin</div>`)}
@@ -2072,8 +2082,9 @@ function guessGrade(name, grades) {
 }
 
 async function viewSales() {
-  const data = await api('/sales');
+  const [data, feed] = await Promise.all([api('/sales'), api('/feed')]);
   state.salesData = data;
+  state.feed = feed;
   const withData = data.sites.filter((s) => s.days > 0);
   const latest = withData.map((s) => s.last_day).sort().pop();
   const rows = data.sites.filter((s) => s.days > 0 || s.active_tanks > 0).map((s) => `
@@ -2085,6 +2096,7 @@ async function viewSales() {
       <div class="main"><div class="title">${esc(itemLabel(i))}</div></div>
       <div class="side">${i.grade_code ? `<span class="chip">${esc(i.grade_code)}</span>` : '<span class="muted">Not fuel, skipped</span>'}</div></div></li>`).join('');
   return headHtml('Sales', `Daily litres sold, from Idealpos Stock Item Sales Trend reports (PDF) or EMC ezi-manager Fuel Sales Reports (Excel).${latest ? ` Latest day uploaded: ${esc(fmtDayShort(latest))}.` : ''}`) +
+    feedCardHtml(feed) +
     `<div class="drop" id="sales-drop">
       <p style="margin:0 0 10px"><strong>Upload sales reports</strong></p>
       <label class="btn primary" for="sales-files">Choose files<input type="file" id="sales-files" accept=".pdf,.xlsx,application/pdf" multiple hidden></label>
@@ -2151,6 +2163,9 @@ function wireSales() {
         res.reports.push(...part.reports);
       }
       invalidate('sites');
+      if (pending.inbox && pending.inbox.length) {
+        await api('/feed/results', { method: 'PUT', body: { results: pending.inbox.map((id) => ({ id, status: 'imported', note: 'Loaded after linking.' })) } });
+      }
       state.salesResult = res;
       toast('Sales uploaded');
       render();
@@ -2254,7 +2269,7 @@ function wireSales() {
     state.salesResult = null;
   }
 
-  const handle = async (files) => {
+  const handle = async (files, inbox) => {
     files = [...files].filter((f) => f);
     if (!files.length) return;
     out.innerHTML = `<div class="note">Reading ${plural(files.length, 'file')}…</div>`;
@@ -2273,7 +2288,7 @@ function wireSales() {
         failed.push({ file: f.name, error: err.message });
       }
     }
-    pending = { reports };
+    pending = { reports, inbox };
     const sameLoc = reports.filter((r, i) => reports.findIndex((x) => x.location === r.location) !== i);
     out.innerHTML = `<div class="card"><table class="summary"><thead><tr><th>Report</th><th class="hide-sm">Location</th><th style="text-align:right">Days</th></tr></thead><tbody>
       ${reports.map((r) => `<tr><td><strong>${esc(r.source === 'EMC' ? r.location : r.file)}</strong><div class="muted" style="font-size:12px">${r.source === 'EMC' ? `${esc(r.file)} · ` : ''}${esc(fmtDayShort(r.start))} – ${esc(fmtDayShort(r.end))} · ${plural(r.items.length, 'item')}${r.missing.length ? ` · ${plural(r.missing.length, 'day')} missing` : ''}</div></td>
@@ -2288,9 +2303,239 @@ function wireSales() {
     if (reports.length) $('#sales-go').onclick = (e) => upload(e.target);
   };
   $('#sales-files').onchange = (e) => handle(e.target.files);
+  wireFeedCard(handle);
   drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
   drop.addEventListener('dragleave', () => drop.classList.remove('over'));
   drop.addEventListener('drop', (e) => { e.preventDefault(); drop.classList.remove('over'); handle(e.dataTransfer.files); });
+}
+
+/* ---------------------------------------------------------- sales feed */
+// Reports emailed (or posted) to the sales feed wait on the server until the app opens.
+// They're read here with the same readers as an upload: reports whose locations and items
+// are already linked go straight in, oldest first; the rest wait on the Sales screen.
+let feedRun = null;
+let feedCheckedAt = 0;
+const b64ToBuffer = (text) => Uint8Array.from(atob(text), (c) => c.charCodeAt(0)).buffer;
+
+async function readFeedFile(f) {
+  const buffer = b64ToBuffer(f.data);
+  if (/\.pdf$/i.test(f.filename)) return [{ file: f.filename, ...(await readIdealposTrend(buffer)) }];
+  if (/\.xlsx$/i.test(f.filename)) {
+    const found = readEmcFuelSales(await readXlsx(buffer));
+    if (!found) throw new Error('This spreadsheet isn’t an EMC Fuel Sales Report.');
+    return found.map((r) => ({ file: f.filename, ...r }));
+  }
+  throw new Error('Not a PDF or Excel (.xlsx) file.');
+}
+
+async function loadFeedFiles(files) {
+  const results = [];
+  const byFile = new Map();
+  for (const f of files) {
+    try {
+      byFile.set(f.id, await readFeedFile(f));
+    } catch (err) {
+      results.push({ id: f.id, status: 'failed', note: err.message });
+    }
+  }
+  let loaded = 0;
+  const all = [...byFile.values()].flat();
+  if (all.length) {
+    const outline = all.map((r) => ({ file: r.file, location: r.location, items: r.items.map((i) => ({ code: i.code, name: i.name })) }));
+    const check = await api('/sales/import', { method: 'POST', body: { reports: outline, check: true } });
+    const locs = new Set(check.needs.locations.map((l) => l.location));
+    const items = new Map(check.needs.items.map((i) => [i.item_code, i]));
+    for (const [id, reports] of byFile) {
+      const why = [];
+      for (const r of reports) {
+        const loc = String(r.location).trim();
+        if (locs.has(loc)) why.push(`${locationLabel(loc)} isn’t linked to a site`);
+        for (const it of r.items) {
+          const code = String(it.code).trim();
+          if (items.has(code)) why.push(`${itemLabel(items.get(code))} isn’t linked to a grade`);
+        }
+        for (const e of check.errors) if (e.startsWith(`${r.file}:`)) why.push(e.slice(r.file.length + 1).trim());
+      }
+      if (why.length) {
+        results.push({ id, status: 'attention', note: `${[...new Set(why)].join('; ')}.` });
+        continue;
+      }
+      try {
+        const res = await api('/sales/import', { method: 'POST', body: { reports: reports.map((r) => ({ ...r, items: r.items.map(({ code, name, days }) => ({ code, name, days })) })) } });
+        results.push({ id, status: 'imported', note: res.reports.map((x) => `${x.site}: ${x.first ? `${fmtDayShort(x.first)} – ${fmtDayShort(x.last)}` : 'no finished days'}`).join('; ') });
+        loaded++;
+      } catch (err) {
+        results.push({ id, status: 'failed', note: err.message });
+      }
+    }
+  }
+  if (results.length) await api('/feed/results', { method: 'PUT', body: { results } });
+  return { loaded, attention: results.filter((r) => r.status === 'attention').length, failed: results.filter((r) => r.status === 'failed').length };
+}
+
+// Reads anything waiting in the feed. Runs before the board, plan and sales screens, at
+// most once a minute unless `force`; shows a note in `main` while it works.
+function syncFeed(main, force) {
+  if (!canDip()) return null;
+  if (feedRun) return feedRun;
+  if (!force && Date.now() - feedCheckedAt < 60000) return null;
+  feedCheckedAt = Date.now();
+  feedRun = (async () => {
+    const total = { loaded: 0, attention: 0, failed: 0 };
+    for (let round = 0; round < 10; round++) {
+      const files = await api('/feed/claim', { method: 'POST', body: {} });
+      if (!files.length) break;
+      if (main) main.innerHTML = `<div class="note">Loading ${plural(files.length, 'emailed sales report')}…</div>`;
+      const r = await loadFeedFiles(files);
+      total.loaded += r.loaded;
+      total.attention += r.attention;
+      total.failed += r.failed;
+    }
+    const parts = [];
+    if (total.loaded) parts.push(`Loaded ${plural(total.loaded, 'emailed sales report')}`);
+    if (total.attention) parts.push(`${plural(total.attention, 'report')} need${total.attention === 1 ? 's' : ''} linking on the Sales screen`);
+    if (total.failed) parts.push(`${plural(total.failed, 'report')} couldn’t be read`);
+    if (parts.length) toast(parts.join('. ') + '.');
+    if (total.loaded) invalidate('sites');
+    return total;
+  })()
+    .catch((err) => { console.warn('Sales feed:', err); return null; })
+    .finally(() => { feedRun = null; });
+  return feedRun;
+}
+
+const FEED_STATUS = { new: ['', 'Waiting'], processing: ['', 'Reading'], imported: ['ok', 'Loaded'], attention: ['warn', 'Needs linking'], failed: ['bad', 'Couldn’t read'] };
+
+function feedCardHtml(feed) {
+  if (!feed) return '';
+  const files = feed.files.slice(0, 15);
+  const steps = `<ol class="feed-steps">
+      ${isAdmin() && !feed.domain_fixed ? `<li><strong>Once, in Cloudflare:</strong> pick a domain in your Cloudflare account. If staff email already uses it, use a subdomain such as reports.yourdomain, so their email isn’t touched. Open Email → Email Routing, turn it on for that domain or subdomain, and add a catch-all rule that sends to the Worker <strong>autofuel</strong>. Then enter the domain under Feed settings here.</li>` : ''}
+      <li><strong>In the Idealpos back office,</strong> run the Stock Item Sales Trend report for one site, listed by day, for the last 7 days, and save it as a shortcut. Do the same for each site.</li>
+      <li><strong>Setup → Schedules:</strong> add a schedule with report type Email, every day early in the morning on the back office terminal, sent to the address above, as PDF. Drag in the shortcuts; each one is sent as its own attachment.</li>
+      <li><strong>EMC sites:</strong> if ezi-manager can email its Fuel Sales Report (Excel), send it to the same address too.</li>
+    </ol>`;
+  const rows = files.map((f) => {
+    const [cls, label] = FEED_STATUS[f.status] || ['', f.status];
+    return `<tr><td><strong>${esc(f.filename)}</strong><span class="sub">${esc(fmtWhen(f.received_at))} · ${esc(f.via === 'upload' ? 'sent by a script' : f.sender || 'email')}</span>${f.note ? `<span class="sub">${esc(f.note)}</span>` : ''}</td>
+      <td class="n"><span class="badge ${cls}">${esc(label)}</span>${f.status === 'attention' ? `<br><button class="btn sm" style="margin-top:6px" data-feed-open="${f.id}">Link and load</button>` : ''}</td></tr>`;
+  }).join('');
+  return `<div class="card pad" id="feed-card" style="margin-bottom:16px">
+    <div class="head" style="margin-bottom:6px"><h2>Automatic sales feed</h2><span class="spacer"></span>
+      <button class="btn sm" id="feed-check">Check now</button>${isAdmin() ? '<button class="btn sm" id="feed-settings">Feed settings</button>' : ''}</div>
+    ${feed.address
+      ? `<p style="margin:0 0 8px">Email sales reports to this address and they load by themselves when the app is next opened:</p>
+         <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><span class="feed-address" id="feed-address">${esc(feed.address)}</span><button class="btn sm" id="feed-copy">Copy</button></div>`
+      : `<p class="muted" style="margin:0">Reports can be emailed in and loaded by themselves. ${isAdmin() ? 'To switch this on, set up an email domain (step 1 below).' : 'An admin needs to switch this on.'}</p>`}
+    <details style="margin-top:12px"${feed.address && files.length ? '' : ' open'}><summary style="cursor:pointer;font-weight:600">How to set it up</summary><div style="margin-top:10px">${steps}</div></details>
+    ${files.length ? `<table class="summary feed-files" style="margin-top:14px"><thead><tr><th>Report</th><th class="n">Status</th></tr></thead><tbody>${rows}</tbody></table>` : ''}
+  </div>`;
+}
+
+function wireFeedCard(handle) {
+  const card = $('#feed-card');
+  if (!card) return;
+  const feed = state.feed;
+  const copy = $('#feed-copy');
+  if (copy) copy.onclick = async () => {
+    try { await navigator.clipboard.writeText(feed.address); toast('Address copied'); } catch { toast(feed.address); }
+  };
+  $('#feed-check').onclick = async (e) => {
+    e.target.disabled = true;
+    await syncFeed(null, true);
+    render();
+  };
+  const settings = $('#feed-settings');
+  if (settings) settings.onclick = () => feedSettingsDialog(feed);
+  for (const btn of $$('[data-feed-open]', card)) {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        const f = await api(`/feed/files/${btn.dataset.feedOpen}`);
+        const file = new File([b64ToBuffer(f.data)], f.filename, { type: f.content_type || '' });
+        await handle([file], [f.id]);
+        // Straight on to the upload, which asks for the missing links.
+        const go = $('#sales-go');
+        if (go) go.click();
+        $('#sales-out').scrollIntoView({ behavior: 'smooth', block: 'start' });
+      } catch (err) {
+        toast(err.message);
+        btn.disabled = false;
+      }
+    };
+  }
+}
+
+function feedSettingsDialog(feed) {
+  openDialog({
+    title: 'Sales feed settings',
+    body: `<div class="grid">
+      <div class="field full"><label for="fd_domain">Email domain</label><input id="fd_domain" value="${esc(feed.domain || '')}" placeholder="reports.example.com"${feed.domain_fixed ? ' disabled' : ''}>
+        <div class="hint">${feed.domain_fixed ? 'Set for the whole app.' : 'A domain in Cloudflare with Email Routing sending everything to the autofuel Worker.'}</div></div>
+      <div class="field full"><label for="fd_senders">Only accept reports from</label><textarea id="fd_senders" rows="2" placeholder="reports@yourcompany.com.au, @yourcompany.com.au">${esc(feed.senders)}</textarea>
+        <div class="hint">Email addresses, or @domain for anyone at that domain. Leave blank to accept any sender; the address itself is hard to guess.</div></div>
+      <div class="field full"><label>Upload address for scripts</label><input value="${esc(feed.upload_url)}?name=Monkland.pdf" readonly>
+        <div class="hint">For a script on the back office PC: POST each file’s bytes here, with its file name after ?name=.</div></div>
+      <div class="field full"><label class="check"><input type="checkbox" id="fd_new"> Change the address (the old one stops working)</label></div>
+    </div>`,
+    onSave: async () => {
+      const body = { senders: $('#fd_senders').value, new_token: $('#fd_new').checked };
+      if (!feed.domain_fixed) body.domain = $('#fd_domain').value;
+      state.feed = await api('/feed', { method: 'PUT', body });
+      toast('Feed settings saved');
+      render();
+    },
+  });
+}
+
+/* ------------------------------------------------------- delivery done */
+// Marks a run done with what actually went in at each site (the load sheet's litres unless
+// the docket says otherwise) and any dips taken after the drop. Until the next dip, the
+// board adds these deliveries to the estimated level.
+function deliveryDialog(run) {
+  const p = run.plan;
+  const b = state.board;
+  const now = Date.now();
+  const gradeCode = new Map((state.cache.grades || []).map((g) => [g.id, g.code]));
+  const body = p.stops.map((st, i) => {
+    const byGrade = new Map();
+    for (const c of p.compartments.filter((x) => x.stop === i)) byGrade.set(c.grade_id, (byGrade.get(c.grade_id) || 0) + c.litres);
+    const site = b && b.sites.find((x) => x.id === st.site_id);
+    const tanks = site ? site.groups.flatMap((g) => g.tanks.map((t) => ({ ...t, grade_code: g.grade_code }))) : [];
+    return `<div class="deliver" data-stop="${i}"${i ? ' style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border)"' : ''}>
+      <h3>${p.stops.length > 1 ? `${i + 1}. ` : ''}${esc(st.site_name)}</h3>
+      <div class="field" style="max-width:200px"><label>Delivered at</label><input type="time" data-at value="${hhmm(Math.min(st.at, now))}"></div>
+      <table class="summary" style="margin-top:8px"><thead><tr><th>Grade</th><th class="n">Loaded</th><th class="n">Delivered</th></tr></thead><tbody>
+        ${[...byGrade].map(([gid, litres]) => `<tr><td><span class="chip">${esc(gradeCode.get(gid) || '')}</span></td><td class="n">${fmtL(litres)}</td>
+          <td class="n"><div class="suffix"><input type="number" inputmode="numeric" step="1" min="0" data-grade="${gid}" value="${litres}" aria-label="${esc(gradeCode.get(gid) || '')} delivered in litres"><span class="muted">L</span></div></td></tr>`).join('')}
+      </tbody></table>
+      ${tanks.length ? `<p class="muted" style="font-size:13px;margin:12px 0 6px">Dips after the drop, if taken. They replace the estimate.</p>
+        <div class="grid">${tanks.map((t) => `<div class="field"><label>${esc(t.name)} <span class="chip">${esc(t.grade_code)}</span></label>
+          <div class="suffix"><input type="number" inputmode="numeric" step="1" min="0" data-tank="${t.id}" placeholder="Litres" aria-label="${esc(t.name)} dip in litres"><span>L</span></div></div>`).join('')}</div>` : ''}
+    </div>`;
+  }).join('');
+  openDialog({
+    title: 'Delivery done',
+    sub: `${p.truck_name}. Litres are from the load sheet; change any that differ on the docket.`,
+    body,
+    saveLabel: 'Save delivery',
+    anyRole: true,
+    onSave: async (form) => {
+      const stops = p.stops.map((st, i) => {
+        const box = $(`[data-stop="${i}"]`, form);
+        const time = $('[data-at]', box).value;
+        return {
+          site_id: st.site_id,
+          at: time ? atFromTime(run.run_date, time) : Math.min(st.at, Date.now()),
+          grades: $$('[data-grade]', box).map((el) => ({ grade_id: Number(el.dataset.grade), litres: el.value === '' ? 0 : Number(el.value) })),
+          dips: $$('[data-tank]', box).filter((el) => el.value !== '').map((el) => ({ tank_id: Number(el.dataset.tank), litres: Number(el.value) })),
+        };
+      });
+      const res = await api(`/runs/${run.id}/complete`, { method: 'POST', body: { stops } });
+      toast(res.warnings && res.warnings.length ? res.warnings[0] : 'Delivery recorded');
+      render();
+    },
+  });
 }
 
 /* ------------------------------------------------------ load optimiser */
@@ -2925,6 +3170,10 @@ function runCardHtml(r) {
     ${p.stops.map((st, i) => `<div class="run-stop"><span class="run-num">${i + 1}</span><strong>${esc(st.site_name)}</strong><span class="muted">about ${esc(fmtTime(st.at))}</span></div>
       <div class="run-comps" style="padding-top:0">${p.compartments.filter((c) => c.stop === i).map((c) => `<span class="comp"><b>C${c.position}</b>${esc(c.grade_code)} ${fmtN(c.litres)}${c.litres < c.capacity ? ' (part)' : ''}</span>`).join('')}</div>`).join('')}
     ${(() => { const w = runWeights(r); return w.length ? `<div class="run-weight">${w.map((x) => `<span>${esc(x.label)} <strong class="num">${tonnes2(x.gross)}</strong> of ${tonnes2(x.limit)} ${x.kind}</span>`).join('')}</div>` : ''; })()}
+    ${r.status === 'done' && r.delivered && r.delivered.length ? `<div class="run-weight">${p.stops.map((st) => {
+      const mine = r.delivered.filter((d) => d.site_id === st.site_id);
+      return mine.length ? `<span>Delivered to ${esc(st.site_name)} <strong class="num">${fmtL(mine.reduce((a, d) => a + d.litres, 0))}</strong> at ${esc(fmtTime(Math.max(...mine.map((d) => d.delivered_at))))}</span>` : '';
+    }).join('')}</div>` : ''}
     <div class="run-foot"><button class="btn" data-act="run-sheet">Copy load sheet</button>
       ${r.status === 'done' ? '<button class="btn ghost" data-act="run-undone">Mark not done</button>' : '<button class="btn ghost" data-act="run-done">Mark done</button>'}</div>
   </div>`;
@@ -3051,8 +3300,9 @@ function wirePlan() {
         const id = Number(btn.closest('[data-run]').dataset.run);
         const run = state.planRuns.find((r) => r.id === id);
         if (act === 'run-sheet') return copyText(loadSheetText(run));
-        if (act === 'run-done' || act === 'run-undone') {
-          await api(`/runs/${id}`, { method: 'PUT', body: { status: act === 'run-done' ? 'done' : 'planned' } });
+        if (act === 'run-done') return deliveryDialog(run);
+        if (act === 'run-undone') {
+          await api(`/runs/${id}`, { method: 'PUT', body: { status: 'planned' } });
           return render();
         }
         if (act === 'run-delete') {
@@ -3130,6 +3380,7 @@ async function render() {
   const ticket = ++renderTicket;
   try {
     await loadSettings();
+    if (['board', 'plan', 'sales'].includes(route)) await syncFeed(main);
     const html = await view();
     if (ticket !== renderTicket) return;
     main.innerHTML = html;
