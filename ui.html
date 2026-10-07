@@ -1779,7 +1779,10 @@ async function readIdealposTrend(buffer) {
     const sum = days.reduce((a, d) => a + it.days[d], 0);
     if (!close(Math.round(sum * 100) / 100, itemTotals[i])) throw new Error(`${it.name}’s figures don’t add up to its total, so nothing was taken from this report.`);
   });
-  return { location: scope[1], start, end, missing, items: items.map(({ code, name, days: d }) => ({ code, name, days: d })) };
+  // When it was printed ("Printed 06/10/2026 08:12:01"): figures for that day run up to then.
+  const stamp = find(/Printed (\d{2})\/(\d{2})\/(\d{4}),? (\d{1,2}):(\d{2})(?::(\d{2}))?/i);
+  const printed = stamp ? `${isoDay(+stamp[3], +stamp[2], +stamp[1])}T${stamp[4].padStart(2, '0')}:${stamp[5]}:${stamp[6] || '00'}` : null;
+  return { location: scope[1], start, end, printed, missing, items: items.map(({ code, name, days: d }) => ({ code, name, days: d })) };
 }
 
 /* ----------------------------------------- EMC ezi-manager fuel sales */
@@ -1908,6 +1911,9 @@ function fmtDayShort(iso) {
   return new Intl.DateTimeFormat('en-AU', { timeZone: 'UTC', weekday: 'short', day: 'numeric', month: 'short' }).format(new Date(iso + 'T00:00:00Z'));
 }
 
+// A time sales run up to: "10:12 am" today, or with the day before it.
+const salesTimeLabel = (ms, b) => `${localIsoOf(ms) === b.today ? '' : `${fmtDayOf(ms)} `}${fmtTime(ms)}`;
+
 function boardSiteHtml(s, b) {
   const [kind, label] = STATUS[s.status];
   const due = s.deliver_by != null;
@@ -1943,7 +1949,7 @@ function boardSiteHtml(s, b) {
       <div class="bs-title"><a href="#/sites/${s.id}">${esc(s.name)}</a><span class="badge ${kind}">${label}</span>
         ${(state.boardRuns || []).filter((r) => r.status === 'planned').flatMap((r) => r.plan.stops.filter((st) => st.site_id === s.id).map((st) => `<a class="badge ok" href="#/plan" style="text-decoration:none">Run planned · ${esc(r.plan.truck_name)} · ${esc(fmtTime(st.at))}</a>`)).join('')}</div>
       <div class="bs-when">${when}</div>
-      <div class="bs-meta">${[partial, opens, s.room_now ? `${fmtL(s.room_now)} room now` : '', s.sales_to ? `sales to ${esc(fmtDayShort(s.sales_to))}` : ''].filter(Boolean).join(' · ')}</div>
+      <div class="bs-meta">${[partial, opens, s.room_now ? `${fmtL(s.room_now)} room now` : '', s.sales_part_at != null ? `sales to ${esc(salesTimeLabel(s.sales_part_at, b))}` : s.sales_to ? `sales to ${esc(fmtDayShort(s.sales_to))}` : ''].filter(Boolean).join(' · ')}</div>
     </div>
     ${s.groups.length ? `<div class="bg-head hide-sm"><span>Grade</span><span>Estimated now</span><span>Sells</span><span>Reaches lowest level</span><span>Room at deliver-by</span></div>${rows}` : '<div class="empty">No active tanks.</div>'}
     ${s.warnings.length ? `<ul class="bs-warn">${s.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}
@@ -1957,8 +1963,11 @@ async function viewBoard() {
   const count = (st) => b.sites.filter((s) => s.status === st).length;
   const flagged = b.sites.filter((s) => s.warnings.length && s.groups.length).length;
   const salesTo = b.sites.map((s) => s.sales_to).filter(Boolean).sort();
+  const partTo = b.sites.map((s) => s.sales_part_at).filter((t) => t != null).sort((x, y) => x - y);
   const st = b.settings;
-  const sub = `Forecast from the latest dips and sales${salesTo.length ? ` up to ${esc(fmtDayShort(salesTo[salesTo.length - 1]))}` : ''}. ` +
+  const upTo = partTo.length ? ` up to ${esc(salesTimeLabel(partTo[partTo.length - 1], b))}${localIsoOf(partTo[partTo.length - 1]) === b.today ? ' today' : ''}`
+    : salesTo.length ? ` up to ${esc(fmtDayShort(salesTo[salesTo.length - 1]))}` : '';
+  const sub = `Forecast from the latest dips and sales${upTo}. ` +
     `Tanks fill to ${Math.round(st.safe_fill_pct * 100)}% and must be refilled before they fall below ${fmtN(st.floor_hours)} hours of sales` +
     `${st.runout_buffer_h ? `, with ${fmtN(st.runout_buffer_h)} hours’ extra margin` : ''}. <a href="#/settings">Change</a>`;
   if (!b.sites.some((s) => s.groups.length)) {
@@ -1971,7 +1980,7 @@ async function viewBoard() {
       <select id="bfilter" aria-label="Which sites"><option value="">All sites</option><option value="due">Delivery within 48 h</option><option value="flags">Sites with notes</option></select></div>
     <div id="board-list" style="display:grid;gap:16px">${b.sites.filter((s) => s.groups.length && s.status !== 'unknown').map((s) => boardSiteHtml(s, b)).join('')}</div>
     ${unknownHtml(b.sites.filter((s) => s.groups.length && s.status === 'unknown'))}
-    <p class="muted" style="font-size:13px;margin-top:16px">Estimates assume no deliveries since each tank’s latest dip, so enter a dip after every delivery. Sales are spread evenly through each day. Updated ${esc(fmtWhen(b.now))}.</p>`;
+    <p class="muted" style="font-size:13px;margin-top:16px">Estimates take each tank’s latest dip, less sales since, plus deliveries from runs marked done. Sales are spread evenly through each day, and forecast after the latest report. Updated ${esc(fmtWhen(b.now))}.</p>`;
 }
 
 function unknownHtml(sites) {
@@ -2009,7 +2018,7 @@ function boardGradeDialog(siteId, gradeId) {
     const floorWhy = g.floor > (st.floor_hours / 24) * g.avg_daily + 1 ? `${Math.round(st.floor_min_pct * 100)}% of capacity` : `${fmtN(st.floor_hours)} hours of sales`;
     body = `<dl class="details" style="margin:0">
         ${row(g.tanks.length > 1 ? 'Latest dips' : 'Latest dip', dips)}
-        ${row('Sold since', `${fmtL(g.sold_since_dip)}${g.sold_since_dip_estimated ? `<div class="hint">${fmtL(g.sold_since_dip_estimated)} of it estimated${g.sales_to ? `, as sales after ${esc(fmtDayShort(g.sales_to))} aren’t uploaded yet` : ''}</div>` : ''}`)}
+        ${row('Sold since', `${fmtL(g.sold_since_dip)}${g.sold_since_dip_estimated ? `<div class="hint">${fmtL(g.sold_since_dip_estimated)} of it estimated${g.sales_part_at != null ? `, as sales after ${esc(salesTimeLabel(g.sales_part_at, b))} aren’t in yet` : g.sales_to ? `, as sales after ${esc(fmtDayShort(g.sales_to))} aren’t uploaded yet` : ''}</div>` : ''}`)}
         ${g.delivered_since_dip ? row('Delivered since', `${fmtL(g.delivered_since_dip)}<div class="hint">From runs marked done. The next dip replaces this.</div>`) : ''}
         ${row('Estimated now', `${fmtL(g.level)} (${pct(g.level, g.capacity)}%)`)}
         ${row('Capacity', fmtL(g.capacity))}
@@ -2091,7 +2100,7 @@ async function viewSales() {
     <li><a class="row" href="#/sites/${s.id}">
       <div class="main"><div class="title">${esc(s.name)} ${s.days ? '' : '<span class="badge warn">No sales yet</span>'}</div>
         <div class="meta">${s.sales_code ? `Sales location ${esc(s.sales_code)}` : 'Not linked to a sales location yet'}</div></div>
-      <div class="side">${s.days ? `<strong>${esc(fmtDayShort(s.first_day))} – ${esc(fmtDayShort(s.last_day))}</strong><br>${plural(s.days, 'day')} · ${fmtL(s.litres / s.days)} a day` : ''}</div>${icon.chev}</a></li>`).join('');
+      <div class="side">${s.days ? `<strong>${esc(fmtDayShort(s.first_day))} – ${esc(fmtDayShort(s.last_day))}</strong><br>${plural(s.days, 'day')} · ${fmtL(s.litres / s.days)} a day` : ''}${s.partial_at && (!s.last_day || s.partial_day > s.last_day) ? `<br><span class="muted">${esc(partLabel({ day: s.partial_day, at: s.partial_at }))}</span>` : ''}</div>${icon.chev}</a></li>`).join('');
   const links = data.items.map((i) => `<li><div class="row" style="cursor:default">
       <div class="main"><div class="title">${esc(itemLabel(i))}</div></div>
       <div class="side">${i.grade_code ? `<span class="chip">${esc(i.grade_code)}</span>` : '<span class="muted">Not fuel, skipped</span>'}</div></div></li>`).join('');
@@ -2107,8 +2116,11 @@ async function viewSales() {
       <div class="card">${rows ? `<ul class="rows">${rows}</ul>` : emptyHtml('No sites yet', '')}</div></div>
     ${data.items.length ? `<div class="section">${headHtml('Sales items', 'The fuels on your sales reports, and which grade each one counts towards.', isAdmin() ? '<button class="btn" data-act="sales-items">Change</button>' : '')}
       <div class="card"><ul class="rows">${links}</ul></div></div>` : ''}
-    <div class="note" style="margin-top:16px">Uploading the same days again replaces them. Days missing from a report are left out of the averages rather than counted as no sales, and today is skipped because it isn’t finished.</div>`;
+    <div class="note" style="margin-top:16px">Uploading the same days again replaces them. Days missing from a report are left out of the averages rather than counted as no sales. The day a report was printed counts as sales so far, up to the time it was printed, until a later report has the whole day.</div>`;
 }
+
+// Sales so far on a day: "Today so far, to 10:12 am".
+const partLabel = (p) => `${p.day === localIsoOf(Date.now()) ? 'Today' : fmtDayShort(p.day)} so far, to ${fmtTime(p.at)}`;
 
 // Idealpos items have a code and a name; EMC grades only a name, used as both.
 const itemLabel = (i) => (i.item_name && i.item_name !== i.item_code ? `${i.item_code} ${i.item_name}` : i.item_code);
@@ -2138,7 +2150,7 @@ function wireSales() {
   const showResults = (res) => {
     const notes = (r) => [
       r.missing.length ? `${plural(r.missing.length, 'day')} missing from the report (${esc(dayRanges(r.missing))})` : '',
-      r.skipped_today ? 'today skipped' : '',
+      r.partial ? esc(partLabel(r.partial)) : r.skipped_today ? 'today skipped' : '',
       r.ignored.length ? `skipped ${esc(r.ignored.join(', '))}` : '',
     ].filter(Boolean).join('; ');
     out.innerHTML = `<div class="note good" style="margin-bottom:12px">Uploaded sales for ${plural(res.reports.length, 'site')}. <a href="#/board">See the run-out board</a></div>
@@ -2333,11 +2345,22 @@ async function loadFeedFiles(files) {
   const byFile = new Map();
   for (const f of files) {
     try {
-      byFile.set(f.id, await readFeedFile(f));
+      // A report that doesn't say when it was printed counts as at the time it arrived.
+      byFile.set(f.id, (await readFeedFile(f)).map((r) => (r.printed ? r : { ...r, as_at: f.received_at })));
     } catch (err) {
       results.push({ id: f.id, status: 'failed', note: err.message });
     }
   }
+  // Several copies of a site's report waiting (the app wasn't opened for a while): only the
+  // newest goes in, as long as it covers the same days.
+  const single = [...byFile].filter(([, reps]) => reps.length === 1 && reps[0].printed);
+  for (const [id, [r]] of single) {
+    if (single.some(([other, [o]]) => other !== id && o.location === r.location && o.printed > r.printed && o.start <= r.start && o.end >= r.end)) {
+      byFile.delete(id);
+      results.push({ id, status: 'imported', note: 'Replaced by a newer copy of the same report.' });
+    }
+  }
+  const partShort = (p) => `${p.day === localIsoOf(Date.now()) ? 'today' : fmtDayShort(p.day)} to ${fmtTime(p.at)}`;
   let loaded = 0;
   const all = [...byFile.values()].flat();
   if (all.length) {
@@ -2362,7 +2385,7 @@ async function loadFeedFiles(files) {
       }
       try {
         const res = await api('/sales/import', { method: 'POST', body: { reports: reports.map((r) => ({ ...r, items: r.items.map(({ code, name, days }) => ({ code, name, days })) })) } });
-        results.push({ id, status: 'imported', note: res.reports.map((x) => `${x.site}: ${x.first ? `${fmtDayShort(x.first)} – ${fmtDayShort(x.last)}` : 'no finished days'}`).join('; ') });
+        results.push({ id, status: 'imported', note: res.reports.map((x) => `${x.site}: ${[x.first ? `${fmtDayShort(x.first)} – ${fmtDayShort(x.last)}` : '', x.partial ? partShort(x.partial) : ''].filter(Boolean).join(' and ') || 'no finished days'}`).join('; ') });
         loaded++;
       } catch (err) {
         results.push({ id, status: 'failed', note: err.message });
@@ -2411,8 +2434,8 @@ function feedCardHtml(feed) {
   const files = feed.files.slice(0, 15);
   const steps = `<ol class="feed-steps">
       ${isAdmin() && !feed.domain_fixed ? `<li><strong>Once, in Cloudflare:</strong> pick a domain in your Cloudflare account. If staff email already uses it, use a subdomain such as reports.yourdomain, so their email isn’t touched. Open Email → Email Routing, turn it on for that domain or subdomain, and add a catch-all rule that sends to the Worker <strong>autofuel</strong>. Then enter the domain under Feed settings here.</li>` : ''}
-      <li><strong>In the Idealpos back office,</strong> run the Stock Item Sales Trend report for one site, listed by day, for the last 7 days, and save it as a shortcut. Do the same for each site.</li>
-      <li><strong>Setup → Schedules:</strong> add a schedule with report type Email, every day early in the morning on the back office terminal, sent to the address above, as PDF. Drag in the shortcuts; each one is sent as its own attachment.</li>
+      <li><strong>In the Idealpos back office,</strong> run the Stock Item Sales Trend report for one site, listed by day, for a date range that runs up to and including today (such as the last 7 days), and save it as a shortcut. Do the same for each site.</li>
+      <li><strong>Setup → Schedules:</strong> add a schedule with report type Email on the back office terminal, sent to the address above, as PDF, every 2 hours through the day. If a schedule can only run once a day, add several at different times. Drag in the shortcuts; each one is sent as its own attachment. Each report counts today’s sales up to the time it was printed.</li>
       <li><strong>EMC sites:</strong> if ezi-manager can email its Fuel Sales Report (Excel), send it to the same address too.</li>
     </ol>`;
   const rows = files.map((f) => {

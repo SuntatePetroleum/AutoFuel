@@ -250,6 +250,22 @@ const MIGRATIONS = [
     `ALTER TABLE settings ADD COLUMN feed_domain TEXT`,
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_settings_feed_token ON settings(feed_token)`,
   ],
+  // v7: sales so far today. Reports sent through the day carry the time they were printed,
+  // so the day they were printed on counts as sold up to that time, not as a whole day.
+  // One row per site and grade: the newest figure replaces the last.
+  [
+    `CREATE TABLE IF NOT EXISTS sales_partial (
+      company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+      grade_id INTEGER NOT NULL REFERENCES grades(id) ON DELETE CASCADE,
+      day TEXT NOT NULL,
+      litres REAL NOT NULL,
+      as_at INTEGER NOT NULL,
+      uploaded_at INTEGER NOT NULL,
+      PRIMARY KEY (site_id, grade_id)
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_sales_partial_company ON sales_partial(company_id)`,
+  ],
 ];
 
 let schemaVersionSeen = 0;
@@ -715,11 +731,13 @@ async function deleteEntity(env, companyId, name, id) {
     run('DELETE FROM dips WHERE tank_id IN (SELECT id FROM tanks WHERE site_id = ?) AND company_id = ?');
     run('DELETE FROM tanks WHERE site_id = ? AND company_id = ?');
     run('DELETE FROM sales_daily WHERE site_id = ? AND company_id = ?');
+    run('DELETE FROM sales_partial WHERE site_id = ? AND company_id = ?');
     run('DELETE FROM deliveries WHERE site_id = ? AND company_id = ?');
   }
   if (name === 'tanks') run('DELETE FROM dips WHERE tank_id = ? AND company_id = ?');
   if (name === 'grades') {
     run('DELETE FROM sales_daily WHERE grade_id = ? AND company_id = ?');
+    run('DELETE FROM sales_partial WHERE grade_id = ? AND company_id = ?');
     run('DELETE FROM sales_items WHERE grade_id = ? AND company_id = ?');
     run('DELETE FROM deliveries WHERE grade_id = ? AND company_id = ?');
   }
@@ -1418,7 +1436,9 @@ async function salesSummary(env, companyId) {
     `SELECT s.id, s.name, s.sales_code,
        (SELECT COUNT(*) FROM tanks t WHERE t.site_id = s.id AND t.active = 1) AS active_tanks,
        MIN(d.day) AS first_day, MAX(d.day) AS last_day, COUNT(DISTINCT d.day) AS days,
-       SUM(CASE WHEN d.litres > 0 THEN d.litres ELSE 0 END) AS litres, MAX(d.uploaded_at) AS uploaded_at
+       SUM(CASE WHEN d.litres > 0 THEN d.litres ELSE 0 END) AS litres, MAX(d.uploaded_at) AS uploaded_at,
+       (SELECT MAX(p.as_at) FROM sales_partial p WHERE p.site_id = s.id) AS partial_at,
+       (SELECT MAX(p.day) FROM sales_partial p WHERE p.site_id = s.id) AS partial_day
      FROM sites s LEFT JOIN sales_daily d ON d.site_id = s.id
      WHERE s.company_id = ? GROUP BY s.id ORDER BY s.name`
   )
@@ -1437,8 +1457,20 @@ async function importSales(request, env, me) {
   if (reports.length > 200) throw new HttpError(400, 'Upload at most 200 reports at a time.');
   const cid = me.company_id;
   const { timezone } = await getSettings(env, cid);
-  const today = localDay(Date.now(), timezone);
+  const now = Date.now();
+  const today = localDay(now, timezone);
   const oldest = shiftDay(today, -800);
+  // When a report was printed, if it says ("2026-10-06T08:12:01", the company's local time),
+  // or the moment it arrived (milliseconds). Its figures for that day run up to then.
+  const printedAt = (r) => {
+    let at = null;
+    const p = String(r.printed || '').match(/^(\d{4}-\d{2}-\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/);
+    if (p) {
+      try { at = zonedToUtc(`${p[1]}T${p[2]}:${p[3]}`, timezone) + (Number(p[4]) || 0) * 1000; } catch { at = null; }
+    } else if (typeof r.as_at === 'number' && Number.isFinite(r.as_at)) at = r.as_at;
+    if (at == null || at < Date.UTC(2000, 0, 1) || at > now + 15 * 60 * 1000) return null;
+    return Math.min(at, now);
+  };
 
   const { results: siteRows } = await env.DB.prepare('SELECT id, name, sales_code FROM sites WHERE company_id = ?').bind(cid).all();
   const siteByCode = new Map(siteRows.filter((s) => s.sales_code).map((s) => [s.sales_code.trim().toLowerCase(), s]));
@@ -1462,14 +1494,21 @@ async function importSales(request, env, me) {
   if (errors.length) return json({ ok: false, errors }, 400);
   if (needs.locations.length || needs.items.length) return json({ ok: false, needs }, 409);
 
-  // Add up litres per site, grade and day.
+  // Add up litres per site, grade and day. Reports are read in the order they were printed,
+  // so a later report for the same site and day replaces an earlier one.
   const totals = new Map();
-  const results = [];
-  for (const r of reports) {
+  const partials = new Map();
+  const results = new Array(reports.length);
+  const order = reports.map((r, i) => ({ r, i, at: printedAt(r) })).sort((a, b) => (a.at ?? -Infinity) - (b.at ?? -Infinity));
+  for (const { r, i, at } of order) {
     const site = siteByCode.get(String(r.location).trim().toLowerCase());
-    const res = { file: String(r.file || '').slice(0, 120), site: site.name, days: 0, first: null, last: null, skipped_today: 0, missing: [], ignored: [] };
+    const res = { file: String(r.file || '').slice(0, 120), site: site.name, days: 0, first: null, last: null, skipped_today: 0, partial: null, missing: [], ignored: [] };
+    // The day the report was printed on is only part of a day; without a print time, today is.
+    const partDay = at != null ? localDay(at, timezone) : null;
+    const cut = partDay || today;
     const seenDays = new Set();
     const mine = new Map();
+    const part = new Map();
     for (const it of r.items || []) {
       const link = items.get(String(it.code).trim());
       const days = it.days && typeof it.days === 'object' ? it.days : {};
@@ -1483,32 +1522,47 @@ async function importSales(request, env, me) {
         if (!DAY_RE.test(day) || !Number.isFinite(litres) || Math.abs(litres) > 1_000_000) {
           throw new HttpError(400, `${res.file || site.name}: ${day} has a figure the app can’t use.`);
         }
-        if (day >= today) { res.skipped_today = 1; continue; }
+        const key = `${site.id}|${link.grade_id}`;
+        if (day === partDay) { part.set(key, (part.get(key) || 0) + litres); continue; }
+        if (day >= cut) { res.skipped_today = 1; continue; }
         if (day < oldest) continue;
         // Items linked to the same grade add up within a report.
-        const key = `${site.id}|${link.grade_id}`;
         if (!mine.has(key)) mine.set(key, new Map());
         const m = mine.get(key);
         m.set(day, (m.get(day) || 0) + litres);
         seenDays.add(day);
       }
     }
-    // A later report for the same site and day replaces an earlier one.
     for (const [key, days] of mine) {
       if (!totals.has(key)) totals.set(key, new Map());
       for (const [day, litres] of days) totals.get(key).set(day, litres);
     }
+    for (const [key, litres] of part) partials.set(key, { day: partDay, litres, at });
+    if (part.size) res.partial = { day: partDay, at };
     const sorted = [...seenDays].sort();
     res.days = sorted.length;
     res.first = sorted[0] || null;
     res.last = sorted[sorted.length - 1] || null;
-    res.missing = (Array.isArray(r.missing) ? r.missing : []).filter((d) => DAY_RE.test(d)).slice(0, 400);
-    results.push(res);
+    res.missing = (Array.isArray(r.missing) ? r.missing : []).filter((d) => DAY_RE.test(d) && d !== partDay).slice(0, 400);
+    results[i] = res;
   }
 
   // One statement per site and grade: the days go in as a JSON list.
-  const now = Date.now();
   const stmts = [];
+  if (partials.size) {
+    // Sales so far on the day: kept unless a newer figure is already in.
+    const list = [...partials].map(([key, p]) => [...key.split('|').map(Number), p.day, Math.round(p.litres * 100) / 100, p.at]);
+    stmts.push(
+      env.DB.prepare(
+        `INSERT INTO sales_partial (company_id, site_id, grade_id, day, litres, as_at, uploaded_at)
+         SELECT ?, json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'),
+           json_extract(value, '$[3]'), json_extract(value, '$[4]'), ? FROM json_each(?) WHERE true
+         ON CONFLICT(site_id, grade_id) DO UPDATE SET day = excluded.day, litres = excluded.litres,
+           as_at = excluded.as_at, uploaded_at = excluded.uploaded_at
+         WHERE excluded.as_at >= sales_partial.as_at`
+      ).bind(cid, now, JSON.stringify(list))
+    );
+  }
   for (const [key, days] of totals) {
     const [siteId, gradeId] = key.split('|').map(Number);
     const list = [...days].map(([d, l]) => [d, Math.round(l * 100) / 100]);
@@ -1569,12 +1623,13 @@ async function runoutBoard(env, companyId) {
   const oldestDip = latest.length ? localDay(Math.min(...latest.map((d) => d.taken_at)), tz) : today;
   const windowStart = shiftDay(today, -(7 * settings.lookback_weeks + 14));
   const from = oldestDip < windowStart ? oldestDip : windowStart;
-  const { results: sales } = await env.DB.prepare(
-    `SELECT d.site_id, d.grade_id, d.day, d.litres, g.code AS grade_code, g.name AS grade_name
-     FROM sales_daily d JOIN grades g ON g.id = d.grade_id WHERE d.company_id = ? AND d.day >= ?`
-  )
-    .bind(companyId, from)
-    .all();
+  const [{ results: sales }, { results: partialRows }] = await Promise.all([
+    env.DB.prepare(
+      `SELECT d.site_id, d.grade_id, d.day, d.litres, g.code AS grade_code, g.name AS grade_name
+       FROM sales_daily d JOIN grades g ON g.id = d.grade_id WHERE d.company_id = ? AND d.day >= ?`
+    ).bind(companyId, from).all(),
+    env.DB.prepare('SELECT site_id, grade_id, day, litres, as_at FROM sales_partial WHERE company_id = ? AND day >= ?').bind(companyId, from).all(),
+  ]);
   const dipOf = new Map(latest.map((d) => [d.tank_id, d]));
   // Deliveries recorded since the oldest dip, from runs marked done.
   const { results: delivered } = await env.DB.prepare(
@@ -1589,6 +1644,12 @@ async function runoutBoard(env, companyId) {
     if (!hist.has(key)) hist.set(key, new Map());
     hist.get(key).set(s.day, s.litres);
     gradeInfo.set(s.grade_id, { code: s.grade_code, name: s.grade_name });
+  }
+  // Sales so far on a day that hasn't come through as a whole day yet (usually today).
+  const partial = new Map();
+  for (const p of partialRows) {
+    const key = `${p.site_id}|${p.grade_id}`;
+    if (p.day >= from && !(hist.has(key) && hist.get(key).has(p.day))) partial.set(key, p);
   }
 
   // Start-of-day times in the company's time zone, so sales spread evenly through each day.
@@ -1607,18 +1668,34 @@ async function runoutBoard(env, companyId) {
     const h = hist.get(key);
     return h && h.has(day) ? Math.max(0, h.get(day)) : forecastFor(fc, day);
   };
-  // Litres sold between two moments.
+  // Litres sold between two moments. On a day with sales so far, those are spread up to the
+  // time they run to, and the forecast rate carries on from there.
   const soldBetween = (key, fc, t0, t1) => {
     if (t1 <= t0) return 0;
+    const p = partial.get(key);
     let total = 0;
     for (let day = dayOf(t0); ; day = shiftDay(day, 1)) {
       const a = startOf(day);
       const b = startOf(shiftDay(day, 1));
       if (a >= t1) break;
+      const rate = litresPerDay(key, fc, day) / (b - a);
+      if (p && p.day === day && p.as_at > a) {
+        const m = Math.min(p.as_at, b);
+        const before = Math.min(m, t1) - Math.max(a, t0);
+        if (before > 0) total += (Math.max(0, p.litres) * before) / (m - a);
+        const after = Math.min(b, t1) - Math.max(m, t0);
+        if (after > 0) total += rate * after;
+        continue;
+      }
       const overlap = Math.min(b, t1) - Math.max(a, t0);
-      if (overlap > 0) total += (litresPerDay(key, fc, day) * overlap) / (b - a);
+      if (overlap > 0) total += rate * overlap;
     }
     return total;
+  };
+  // Sales so far that follow straight on from the last whole day (else null).
+  const partAt = (key, fc) => {
+    const p = partial.get(key);
+    return p && (!fc || p.day === shiftDay(fc.last, 1)) ? p.as_at : null;
   };
   // The first moment from `t0` (level `level0`) when the level falls to `target`, or null.
   const whenLevel = (key, fc, t0, level0, target) => {
@@ -1652,6 +1729,7 @@ async function runoutBoard(env, companyId) {
         capacity, avg_daily: Math.round(avg),
         tanks: gt.map((t) => ({ id: t.id, name: t.name, capacity: t.capacity_l, dip: dipOf.get(t.id) ? { litres: dipOf.get(t.id).litres, at: dipOf.get(t.id).taken_at } : null })),
         sales_to: fc ? fc.last : null,
+        sales_part_at: partAt(key, fc),
         fill_to: Math.max(0, Math.round(capacity * settings.safe_fill_pct - settings.overfill_margin_l)),
         floor: Math.round(Math.max((settings.floor_hours / 24) * avg, settings.floor_min_pct * capacity)),
       };
@@ -1670,7 +1748,8 @@ async function runoutBoard(env, companyId) {
           const into = drops.filter((d) => d.delivered_at > t.dip.at).reduce((a, d) => a + d.litres, 0) * share;
           deliveredSince += into;
           level += t.dip.litres - sold + into;
-          const actualTo = fc ? startOf(shiftDay(fc.last, 1)) : t.dip.at;
+          // Sales up to here are actual figures; after it, forecast.
+          const actualTo = g.sales_part_at ?? (fc ? startOf(shiftDay(fc.last, 1)) : t.dip.at);
           const a = soldBetween(key, fc, t.dip.at, Math.min(now, Math.max(t.dip.at, actualTo))) * share;
           soldActual += a;
           soldForecast += sold - a;
@@ -1745,6 +1824,10 @@ async function runoutBoard(env, companyId) {
       if (g.level != null && g.dip_litres > g.capacity) warnings.push(`${g.grade_code}’s latest dip is more than its listed capacity.`);
     }
     const salesTo = groups.map((g) => g.sales_to).filter(Boolean).sort();
+    // How far the site's sales are in, going by the grade that's furthest behind.
+    const behind = groups.filter((g) => g.sales_to || g.sales_part_at)
+      .map((g) => ({ at: g.sales_part_at ?? startOf(shiftDay(g.sales_to, 1)), part: g.sales_part_at != null }))
+      .sort((a, b) => a.at - b.at)[0] || null;
 
     let status = 'unknown';
     if (deliverBy != null) {
@@ -1757,6 +1840,7 @@ async function runoutBoard(env, companyId) {
       id: site.id, name: site.name, status, deliver_by: deliverBy, window_opens: opens,
       room_now: live.reduce((a, g) => a + g.room_now, 0),
       sales_to: salesTo.length ? salesTo[0] : null,
+      sales_part_at: behind && behind.part ? behind.at : null,
       groups, warnings,
     });
   }
@@ -1954,7 +2038,7 @@ async function deleteRun(env, me, id) {
 
 const FEED_FILES = /\.(pdf|xlsx)$/i;
 const FEED_MAX_B64 = 1_900_000; // D1 rows stay under 2 MB
-const FEED_KEEP_DAYS = 90;
+const FEED_KEEP_DAYS = 30;
 
 function newFeedToken() {
   const letters = 'abcdefghijkmnpqrstuvwxyz23456789';
@@ -2052,8 +2136,11 @@ async function feedResults(request, env, me) {
   const now = Date.now();
   const stmts = list.map((r) => {
     const status = coerce('status', { type: 'text', required: true, options: ['imported', 'attention', 'failed', 'new'], label: 'Status' }, r.status);
-    return env.DB.prepare('UPDATE inbox SET status = ?, note = ?, processed_at = ? WHERE id = ? AND company_id = ?')
-      .bind(status, r.note == null ? null : String(r.note).slice(0, 500), now, Number(r.id), me.company_id);
+    // A file that's been loaded isn't kept: its figures are in the sales now.
+    return env.DB.prepare(
+      `UPDATE inbox SET status = ?, note = ?, processed_at = ?, data = CASE WHEN ? = 'imported' THEN NULL ELSE data END
+       WHERE id = ? AND company_id = ?`
+    ).bind(status, r.note == null ? null : String(r.note).slice(0, 500), now, status, Number(r.id), me.company_id);
   });
   if (stmts.length) await env.DB.batch(stmts);
   return json({ ok: true });
