@@ -14,3 +14,10 @@ database_id = "19b7c211-65f5-4dc1-8cde-c61c78e8458e"
 type = "Text"
 globs = ["**/*.html"]
 fallthrough = true
+
+# Drivers' paperwork (photos and PDFs). Create an R2 bucket called autofuel-paperwork in
+# the Cloudflare dashboard (R2 Object Storage) before deploying with these lines.
+# Without them, paperwork is kept in the database instead.
+[[r2_buckets]]
+binding = "PAPERWORK"
+bucket_name = "autofuel-paperwork"
