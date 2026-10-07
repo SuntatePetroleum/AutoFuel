@@ -1771,22 +1771,31 @@ async function runoutBoard(env, companyId) {
         floor: Math.round(Math.max((settings.floor_hours / 24) * avg, settings.floor_min_pct * capacity)),
       };
       g.state = !fc ? 'no_sales' : g.tanks.some((t) => !t.dip) ? 'no_dip' : avg <= 0 ? 'no_recent_sales' : 'ok';
+      // Each tank of the grade sells its share by capacity, from its own dip time, and takes
+      // its share of any delivery made since then.
+      const drops = delivered.filter((d) => d.site_id === site.id && d.grade_id === gradeId);
+      const parts = new Map();
+      for (const t of g.tanks) {
+        if (!t.dip) continue;
+        const share = capacity ? t.capacity / capacity : 1;
+        const [a, f] = soldSplit(key, fc, t.dip.at, now);
+        const into = drops.filter((d) => d.delivered_at > t.dip.at).reduce((s, d) => s + d.litres, 0) * share;
+        const p = { actual: a * share, forecast: f * share, into, level: t.dip.litres - (a + f) * share + into };
+        parts.set(t.id, p);
+        // The tank's estimated level now (needs sales to work from).
+        if (fc) t.est = { level: Math.max(0, Math.round(p.level)), sold: Math.round(p.actual + p.forecast), sold_estimated: Math.round(p.forecast), delivered: Math.round(into) };
+      }
       if (g.tanks.every((t) => t.dip)) {
-        // Each tank of the grade sells its share by capacity, from its own dip time, and
-        // takes its share of any delivery made since then.
-        const drops = delivered.filter((d) => d.site_id === site.id && d.grade_id === gradeId);
         let level = 0;
         let soldActual = 0;
         let soldForecast = 0;
         let deliveredSince = 0;
         for (const t of g.tanks) {
-          const share = capacity ? t.capacity / capacity : 1;
-          const [a, f] = soldSplit(key, fc, t.dip.at, now);
-          const into = drops.filter((d) => d.delivered_at > t.dip.at).reduce((s, d) => s + d.litres, 0) * share;
-          deliveredSince += into;
-          level += t.dip.litres - (a + f) * share + into;
-          soldActual += a * share;
-          soldForecast += f * share;
+          const p = parts.get(t.id);
+          deliveredSince += p.into;
+          level += p.level;
+          soldActual += p.actual;
+          soldForecast += p.forecast;
         }
         g.dip_litres = g.tanks.reduce((a, t) => a + t.dip.litres, 0);
         g.dip_at = Math.min(...g.tanks.map((t) => t.dip.at));

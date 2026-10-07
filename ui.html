@@ -94,7 +94,12 @@
   .comp { font-size: 12px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 6px; font-variant-numeric: tabular-nums; }
   .comp b { color: var(--faint); font-weight: 600; margin-right: 4px; }
   .level { height: 6px; border-radius: 999px; background: var(--surface-2); overflow: hidden; margin-top: 8px; max-width: 360px; }
-  .level span { display: block; height: 100%; background: var(--accent); border-radius: 999px; }
+  .level { position: relative; }
+  .level span { position: absolute; left: 0; top: 0; display: block; height: 100%; background: var(--accent); border-radius: 999px; }
+  .level span.was { opacity: 0.25; }
+  .dip-was { color: var(--muted); font-size: 13px; margin-top: 2px; white-space: normal; }
+  .nw { white-space: nowrap; }
+  .dip-side { max-width: 58%; }
   .level.over span { background: var(--warn); }
   .group-head { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--border); background: var(--surface-2); border-radius: var(--radius) var(--radius) 0 0; }
   .group-head a { font-weight: 650; color: var(--text); text-decoration: none; }
@@ -1112,9 +1117,20 @@ function wireImport() {
 }
 
 /* --------------------------------------------------------------- dips */
-function levelBar(litres, cap) {
+function levelBar(litres, cap, was) {
   const p = pct(litres, cap);
-  return `<div class="level${p > 100 ? ' over' : ''}" aria-hidden="true"><span style="width:${Math.min(100, Math.max(0, p))}%"></span></div>`;
+  const w = (x) => Math.min(100, Math.max(0, x));
+  return `<div class="level${p > 100 ? ' over' : ''}" aria-hidden="true">${was != null ? `<span class="was" style="width:${w(pct(was, cap))}%"></span>` : ''}<span style="width:${w(p)}%"></span></div>`;
+}
+
+// Each tank's estimated level now, from the run-out board: its latest dip, less sales since,
+// plus deliveries since. Kept for the Enter dips dialog.
+async function tankEstimates() {
+  const b = await api('/board').catch(() => null);
+  const map = new Map();
+  for (const s of (b && b.sites) || []) for (const g of s.groups) for (const t of g.tanks) if (t.est) map.set(t.id, t.est);
+  state.tankEst = map;
+  return map;
 }
 
 function dipState(dip) {
@@ -1130,7 +1146,7 @@ function dipLine(tank, dip) {
 }
 
 async function viewDips() {
-  const [sites, tanks, latest, settings] = await Promise.all([load('sites'), load('tanks'), api('/dips/latest'), loadSettings()]);
+  const [sites, tanks, latest, settings, estOf] = await Promise.all([load('sites'), load('tanks'), api('/dips/latest'), loadSettings(), tankEstimates()]);
   const dipOf = new Map(latest.map((d) => [d.tank_id, d]));
   const active = tanks.filter((t) => t.active);
   const counts = { fresh: 0, stale: 0, never: 0 };
@@ -1146,12 +1162,15 @@ async function viewDips() {
     const rows = mine.map((t) => {
       const d = dipOf.get(t.id);
       const st = dipState(d);
+      const est = d && estOf.get(t.id);
+      const dipped = d ? `<span class="nw">${d.source === 'delivery' ? 'Dipped after delivery' : 'Dipped'} ${fmtL(d.litres)}</span> · <span class="nw">${esc(fmtWhen(d.taken_at))}</span> · <span class="nw">${ago(d.taken_at)}</span>` : '';
+      const since = est ? [est.sold ? `${fmtL(est.sold)} sold since` : 'nothing sold since', est.delivered ? `${fmtL(est.delivered)} delivered` : ''].filter(Boolean).join(', ') : '';
       return `<li><button class="row" data-dip-tank="${t.id}">
         <div class="main"><div class="title">${esc(t.name)} <span class="chip">${esc(t.grade_code)}</span></div>
-          ${d ? levelBar(d.litres, t.capacity_l) : ''}</div>
-        <div class="side">${d
-          ? `<strong class="num">${fmtL(d.litres)}</strong> · ${pct(d.litres, t.capacity_l)}%<br>${esc(fmtWhen(d.taken_at))} · ${ago(d.taken_at)}${st === 'stale' ? '<br><span class="badge warn">Out of date</span>' : ''}`
-          : '<span class="badge warn">No dip yet</span>'}</div>${icon.chev}</button></li>`;
+          ${d ? (est ? levelBar(est.level, t.capacity_l, d.litres) : levelBar(d.litres, t.capacity_l)) : ''}</div>
+        <div class="side dip-side">${!d ? '<span class="badge warn">No dip yet</span>'
+          : est ? `<strong class="num">${fmtL(est.level)}</strong> · ${pct(est.level, t.capacity_l)}% <span class="muted">now</span><div class="dip-was">${dipped}<br>${since}</div>`
+          : `<strong class="num">${fmtL(d.litres)}</strong> · ${pct(d.litres, t.capacity_l)}%<div class="dip-was">${dipped}<br>No sales uploaded to estimate from</div>`}${st === 'stale' ? '<span class="badge warn" style="margin-top:4px">Dip out of date</span>' : ''}</div>${icon.chev}</button></li>`;
     }).join('');
     return `<div class="card" data-group="${esc(s.name.toLowerCase())}" data-needs="${needs ? 1 : 0}">
       <div class="group-head"><a href="#/sites/${s.id}">${esc(s.name)}</a><span class="spacer"></span>
@@ -1160,7 +1179,7 @@ async function viewDips() {
   }).join('');
 
   const inactive = tanks.length - active.length;
-  return headHtml('Tank dips', `Latest reading for each active tank, in litres. A dip older than ${fmtN(settings.dip_stale_hours)} hours is flagged.${inactive ? ` ${plural(inactive, 'inactive tank')} not shown.` : ''}`,
+  return headHtml('Tank dips', `Each active tank’s level now, worked out from its latest dip less the sales since (plus deliveries from runs marked done), with the dip underneath. A dip older than ${fmtN(settings.dip_stale_hours)} hours is flagged.${inactive ? ` ${plural(inactive, 'inactive tank')} not shown.` : ''}`,
     canDip() ? '<button class="btn" data-dip-upload>Upload</button><button class="btn primary" data-dip-enter="">Enter dips</button>' : '') +
     (flash ? `<div class="note ${flash.kind}" style="margin-bottom:12px">${flash.html}</div>` : '') +
     (active.length ? `<div class="stats"><span><strong>${fmtN(counts.fresh)}</strong> up to date</span><span><strong>${fmtN(counts.stale)}</strong> out of date</span><span><strong>${fmtN(counts.never)}</strong> never dipped</span></div>
@@ -1173,6 +1192,7 @@ async function viewDips() {
 async function enterDipsDialog(siteId) {
   const [sites, tanks, latest] = await Promise.all([load('sites'), load('tanks'), api('/dips/latest')]);
   const dipOf = new Map(latest.map((d) => [d.tank_id, d]));
+  const est = state.tankEst || new Map();
   const withTanks = sites.filter((s) => tanks.some((t) => t.site_id === s.id && t.active));
   if (!withTanks.length) throw new Error('There are no active tanks to dip yet.');
   let current = withTanks.find((s) => s.id === siteId) ? siteId : withTanks[0].id;
@@ -1180,7 +1200,7 @@ async function enterDipsDialog(siteId) {
     const d = dipOf.get(t.id);
     return `<div class="field"><label for="dip_${t.id}">${esc(t.name)} <span class="chip">${esc(t.grade_code)}</span></label>
       <div class="suffix"><input type="text" inputmode="numeric" id="dip_${t.id}" data-tank="${t.id}" autocomplete="off" placeholder="Litres"><span>L</span></div>
-      <div class="hint">Capacity ${fmtL(t.capacity_l)}${d ? ` · last ${fmtL(d.litres)}, ${ago(d.taken_at)}` : ' · no dip yet'}</div></div>`;
+      <div class="hint">Capacity ${fmtL(t.capacity_l)}${d ? ` · last ${fmtL(d.litres)}, ${ago(d.taken_at)}` : ' · no dip yet'}${est.has(t.id) ? ` · about ${fmtL(est.get(t.id).level)} now` : ''}</div></div>`;
   }).join('');
   openDialog({
     title: 'Enter dips',
@@ -1188,7 +1208,7 @@ async function enterDipsDialog(siteId) {
     anyRole: true,
     body: `<div class="grid">
       <div class="field"><label for="dip_site">Site</label><select id="dip_site">${withTanks.map((s) => `<option value="${s.id}"${s.id === current ? ' selected' : ''}>${esc(s.name)}</option>`).join('')}</select></div>
-      <div class="field"><label for="dip_time">Taken at</label><input type="datetime-local" id="dip_time" value="${nowLocal()}" max="${nowLocal()}"></div>
+      <div class="field"><label for="dip_time">Taken at</label><input type="datetime-local" id="dip_time" value="${nowLocal()}" max="${nowLocal()}"><div class="hint">When the tanks were dipped. Sales from this time on come off the dip.</div></div>
     </div><div class="grid" id="dip_inputs" style="margin-top:14px">${inputs(current)}</div>`,
     saveLabel: 'Save dips',
     onSave: async () => {
@@ -3451,7 +3471,7 @@ async function render() {
   const ticket = ++renderTicket;
   try {
     await loadSettings();
-    if (['board', 'plan', 'sales'].includes(route)) await syncFeed(main);
+    if (['board', 'plan', 'sales', 'dips'].includes(route)) await syncFeed(main);
     const html = await view();
     if (ticket !== renderTicket) return;
     main.innerHTML = html;
