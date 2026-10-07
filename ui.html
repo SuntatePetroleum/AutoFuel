@@ -1827,7 +1827,7 @@ async function readIdealposTrend(buffer) {
 }
 
 /* ----------------------------------------- EMC ezi-manager fuel sales */
-// Reads an EMC ezi-manager "Fuel Sales Report" exported to Excel: one or more sites, each
+// Reads an EMC ezi-manager "Fuel Sales Report" or "Fuel Daily Sales Report" exported to Excel: one or more sites, each
 // a list of rows (date sold, tank number, grade description, litres sold). Returns one
 // report per site, in the same shape as an Idealpos report. Within a site, a grade with
 // no row on a day the site traded counts as no sales that day; days with no rows at all
@@ -1844,7 +1844,7 @@ function emcDay(v) {
 function readEmcFuelSales(sheets) {
   const clean = (v) => String(v == null ? '' : v).replace(/\s+/g, ' ').trim();
   for (const rows of Object.values(sheets)) {
-    if (!rows || !rows.some((r) => r && r.some((c) => clean(c) === 'Fuel Sales Report'))) continue;
+    if (!rows || !rows.some((r) => r && r.some((c) => /^Fuel (Daily )?Sales Report$/i.test(clean(c))))) continue;
     // Column positions come from the header row.
     const headRow = rows.find((r) => r && r.some((c) => clean(c).toLowerCase() === 'date sold'));
     if (!headRow) throw new Error('Couldn’t find the Date Sold column in this Fuel Sales Report.');
@@ -1893,7 +1893,7 @@ function readEmcFuelSales(sheets) {
       }
       // A site heading is a row with only a name in the first column.
       const text = clean(r[filled[0][0]]);
-      if (filled.length === 1 && filled[0][0] === cDate && !/ezi-manager|fuel sales report|page \d/i.test(text)) {
+      if (filled.length === 1 && filled[0][0] === cDate && !/ezi-manager|fuel (daily )?sales report|page \d/i.test(text)) {
         site = text;
         if (!sites.has(site)) sites.set(site, { days: new Set(), items: new Map() });
       }
@@ -2477,7 +2477,7 @@ function feedCardHtml(feed) {
       ${isAdmin() && !feed.domain_fixed ? `<li><strong>Once, in Cloudflare:</strong> pick a domain in your Cloudflare account. If staff email already uses it, use a subdomain such as reports.yourdomain, so their email isn’t touched. Open Email → Email Routing, turn it on for that domain or subdomain, and add a catch-all rule that sends to the Worker <strong>autofuel</strong>. Then enter the domain under Feed settings here.</li>` : ''}
       <li><strong>In the Idealpos back office,</strong> run the Stock Item Sales Trend report for one site (Location from and to that site’s code), listed by day, with the date range Month to Date. Press View, then the S button to save it as a shortcut. Do the same for each site.</li>
       <li><strong>Setup → Schedules:</strong> add a schedule with report type Email on the back office terminal, sent to the address above, as PDF, every 2 hours through the day, with the last run late in the evening. If a schedule can only run once a day, add several at different times. Drag in all the shortcuts: they go as separate attachments on one email. Each report counts today’s sales up to the time it was printed.</li>
-      <li><strong>EMC sites:</strong> if ezi-manager can email its Fuel Sales Report (Excel), send it to the same address too.</li>
+      <li><strong>EMC sites:</strong> if ezi-manager can email its Fuel Sales or Fuel Sales – Daily report as Excel, with every site ticked and a date range that runs to today, send it to the same address too.</li>
     </ol>`;
   const rows = files.map((f) => {
     const [cls, label] = FEED_STATUS[f.status] || ['', f.status];
