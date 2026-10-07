@@ -2392,13 +2392,18 @@ async function loadFeedFiles(files) {
       results.push({ id: f.id, status: 'failed', note: err.message });
     }
   }
-  // Several copies of a site's report waiting (the app wasn't opened for a while): only the
-  // newest goes in, as long as it covers the same days.
-  const single = [...byFile].filter(([, reps]) => reps.length === 1 && reps[0].printed);
-  for (const [id, [r]] of single) {
-    if (single.some(([other, [o]]) => other !== id && o.location === r.location && o.printed > r.printed && o.start <= r.start && o.end >= r.end)) {
-      byFile.delete(id);
-      results.push({ id, status: 'imported', note: 'Replaced by a newer copy of the same report.' });
+  // Several copies of a report waiting (it's sent every hour or two, and the app wasn't opened
+  // for a while): only the newest goes in, as long as it covers the same sites and days.
+  // Newest by print time where reports have one (Idealpos), otherwise by arrival (EMC).
+  const received = new Map(files.map((f) => [f.id, f.received_at]));
+  const newer = ([g, gr], [f, fr]) => (gr[0].printed && fr[0].printed ? gr[0].printed > fr[0].printed
+    : !gr[0].printed && !fr[0].printed && received.get(g) > received.get(f));
+  const covers = (gr, fr) => fr.every((r) => gr.some((o) => o.location === r.location && o.start <= r.start && o.end >= r.end));
+  const waiting = [...byFile];
+  for (const entry of waiting) {
+    if (waiting.some((other) => other[0] !== entry[0] && newer(other, entry) && covers(other[1], entry[1]))) {
+      byFile.delete(entry[0]);
+      results.push({ id: entry[0], status: 'imported', note: 'Replaced by a newer copy of the same report.' });
     }
   }
   const partShort = (p) => `${p.day === localIsoOf(Date.now()) ? 'today' : fmtDayShort(p.day)} to ${fmtTime(p.at)}`;

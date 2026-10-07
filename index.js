@@ -1592,7 +1592,8 @@ async function importSales(request, env, me) {
       env.DB.prepare(
         `INSERT INTO sales_daily (company_id, site_id, grade_id, day, litres, uploaded_at)
          SELECT ?, ?, ?, json_extract(value, '$[0]'), json_extract(value, '$[1]'), ? FROM json_each(?) WHERE true
-         ON CONFLICT(site_id, grade_id, day) DO UPDATE SET litres = excluded.litres, uploaded_at = excluded.uploaded_at`
+         ON CONFLICT(site_id, grade_id, day) DO UPDATE SET litres = excluded.litres, uploaded_at = excluded.uploaded_at
+         WHERE sales_daily.litres IS NOT excluded.litres`
       ).bind(cid, siteId, gradeId, now, JSON.stringify(list))
     );
   }
