@@ -2434,8 +2434,8 @@ function feedCardHtml(feed) {
   const files = feed.files.slice(0, 15);
   const steps = `<ol class="feed-steps">
       ${isAdmin() && !feed.domain_fixed ? `<li><strong>Once, in Cloudflare:</strong> pick a domain in your Cloudflare account. If staff email already uses it, use a subdomain such as reports.yourdomain, so their email isn’t touched. Open Email → Email Routing, turn it on for that domain or subdomain, and add a catch-all rule that sends to the Worker <strong>autofuel</strong>. Then enter the domain under Feed settings here.</li>` : ''}
-      <li><strong>In the Idealpos back office,</strong> run the Stock Item Sales Trend report for one site, listed by day, for a date range that runs up to and including today (such as the last 7 days), and save it as a shortcut. Do the same for each site.</li>
-      <li><strong>Setup → Schedules:</strong> add a schedule with report type Email on the back office terminal, sent to the address above, as PDF, every 2 hours through the day. If a schedule can only run once a day, add several at different times. Drag in the shortcuts; each one is sent as its own attachment. Each report counts today’s sales up to the time it was printed.</li>
+      <li><strong>In the Idealpos back office,</strong> run the Stock Item Sales Trend report for one site (Location from and to that site’s code), listed by day, with the date range Month to Date. Press View, then the S button to save it as a shortcut. Do the same for each site.</li>
+      <li><strong>Setup → Schedules:</strong> add a schedule with report type Email on the back office terminal, sent to the address above, as PDF, every 2 hours through the day, with the last run late in the evening. If a schedule can only run once a day, add several at different times. Drag in all the shortcuts: they go as separate attachments on one email. Each report counts today’s sales up to the time it was printed.</li>
       <li><strong>EMC sites:</strong> if ezi-manager can email its Fuel Sales Report (Excel), send it to the same address too.</li>
     </ol>`;
   const rows = files.map((f) => {

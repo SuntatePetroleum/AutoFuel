@@ -266,6 +266,26 @@ const MIGRATIONS = [
     )`,
     `CREATE INDEX IF NOT EXISTS idx_sales_partial_company ON sales_partial(company_id)`,
   ],
+  // v8: keep sales so far for each day, not just the latest. Reports for "month to date"
+  // start again on the 1st, so the last day of a month never comes through as a whole day:
+  // its latest figure is kept and the rest of that day forecast.
+  [
+    `CREATE TABLE IF NOT EXISTS sales_partial_v8 (
+      company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      site_id INTEGER NOT NULL REFERENCES sites(id) ON DELETE CASCADE,
+      grade_id INTEGER NOT NULL REFERENCES grades(id) ON DELETE CASCADE,
+      day TEXT NOT NULL,
+      litres REAL NOT NULL,
+      as_at INTEGER NOT NULL,
+      uploaded_at INTEGER NOT NULL,
+      PRIMARY KEY (site_id, grade_id, day)
+    )`,
+    `INSERT OR IGNORE INTO sales_partial_v8 (company_id, site_id, grade_id, day, litres, as_at, uploaded_at)
+     SELECT company_id, site_id, grade_id, day, litres, as_at, uploaded_at FROM sales_partial`,
+    `DROP TABLE sales_partial`,
+    `ALTER TABLE sales_partial_v8 RENAME TO sales_partial`,
+    `CREATE INDEX IF NOT EXISTS idx_sales_partial_company_day ON sales_partial(company_id, day)`,
+  ],
 ];
 
 let schemaVersionSeen = 0;
@@ -1537,7 +1557,8 @@ async function importSales(request, env, me) {
       if (!totals.has(key)) totals.set(key, new Map());
       for (const [day, litres] of days) totals.get(key).set(day, litres);
     }
-    for (const [key, litres] of part) partials.set(key, { day: partDay, litres, at });
+    // Reports are in print order, so a later one for the same day replaces an earlier one.
+    for (const [key, litres] of part) partials.set(`${key}|${partDay}`, { key, day: partDay, litres, at });
     if (part.size) res.partial = { day: partDay, at };
     const sorted = [...seenDays].sort();
     res.days = sorted.length;
@@ -1550,17 +1571,18 @@ async function importSales(request, env, me) {
   // One statement per site and grade: the days go in as a JSON list.
   const stmts = [];
   if (partials.size) {
-    // Sales so far on the day: kept unless a newer figure is already in.
-    const list = [...partials].map(([key, p]) => [...key.split('|').map(Number), p.day, Math.round(p.litres * 100) / 100, p.at]);
+    // Sales so far on the day: kept unless a newer figure for that day is already in.
+    const list = [...partials.values()].map((p) => [...p.key.split('|').map(Number), p.day, Math.round(p.litres * 100) / 100, p.at]);
     stmts.push(
       env.DB.prepare(
         `INSERT INTO sales_partial (company_id, site_id, grade_id, day, litres, as_at, uploaded_at)
          SELECT ?, json_extract(value, '$[0]'), json_extract(value, '$[1]'), json_extract(value, '$[2]'),
            json_extract(value, '$[3]'), json_extract(value, '$[4]'), ? FROM json_each(?) WHERE true
-         ON CONFLICT(site_id, grade_id) DO UPDATE SET day = excluded.day, litres = excluded.litres,
+         ON CONFLICT(site_id, grade_id, day) DO UPDATE SET litres = excluded.litres,
            as_at = excluded.as_at, uploaded_at = excluded.uploaded_at
          WHERE excluded.as_at >= sales_partial.as_at`
-      ).bind(cid, now, JSON.stringify(list))
+      ).bind(cid, now, JSON.stringify(list)),
+      env.DB.prepare('DELETE FROM sales_partial WHERE company_id = ? AND day < ?').bind(cid, shiftDay(today, -90))
     );
   }
   for (const [key, days] of totals) {
@@ -1645,11 +1667,14 @@ async function runoutBoard(env, companyId) {
     hist.get(key).set(s.day, s.litres);
     gradeInfo.set(s.grade_id, { code: s.grade_code, name: s.grade_name });
   }
-  // Sales so far on a day that hasn't come through as a whole day yet (usually today).
+  // Sales so far on days that haven't come through as whole days (usually today, and the
+  // last day of last month on the 1st), by site and grade, then day.
   const partial = new Map();
   for (const p of partialRows) {
     const key = `${p.site_id}|${p.grade_id}`;
-    if (p.day >= from && !(hist.has(key) && hist.get(key).has(p.day))) partial.set(key, p);
+    if (hist.has(key) && hist.get(key).has(p.day)) continue;
+    if (!partial.has(key)) partial.set(key, new Map());
+    partial.get(key).set(p.day, p);
   }
 
   // Start-of-day times in the company's time zone, so sales spread evenly through each day.
@@ -1668,34 +1693,46 @@ async function runoutBoard(env, companyId) {
     const h = hist.get(key);
     return h && h.has(day) ? Math.max(0, h.get(day)) : forecastFor(fc, day);
   };
-  // Litres sold between two moments. On a day with sales so far, those are spread up to the
-  // time they run to, and the forecast rate carries on from there.
-  const soldBetween = (key, fc, t0, t1) => {
-    if (t1 <= t0) return 0;
-    const p = partial.get(key);
-    let total = 0;
+  // Litres sold between two moments, as [actual, forecast]. Whole days uploaded are actual;
+  // on a day with sales so far, those are spread up to the time they run to and the forecast
+  // rate carries on from there; other days are forecast.
+  const soldSplit = (key, fc, t0, t1) => {
+    if (t1 <= t0) return [0, 0];
+    const h = hist.get(key);
+    const pd = partial.get(key);
+    let actual = 0;
+    let forecast = 0;
     for (let day = dayOf(t0); ; day = shiftDay(day, 1)) {
       const a = startOf(day);
       const b = startOf(shiftDay(day, 1));
       if (a >= t1) break;
-      const rate = litresPerDay(key, fc, day) / (b - a);
-      if (p && p.day === day && p.as_at > a) {
+      const p = pd && pd.get(day);
+      if (h && h.has(day)) {
+        const overlap = Math.min(b, t1) - Math.max(a, t0);
+        if (overlap > 0) actual += (Math.max(0, h.get(day)) * overlap) / (b - a);
+      } else if (p && p.as_at > a) {
         const m = Math.min(p.as_at, b);
         const before = Math.min(m, t1) - Math.max(a, t0);
-        if (before > 0) total += (Math.max(0, p.litres) * before) / (m - a);
+        if (before > 0) actual += (Math.max(0, p.litres) * before) / (m - a);
         const after = Math.min(b, t1) - Math.max(m, t0);
-        if (after > 0) total += rate * after;
-        continue;
+        if (after > 0) forecast += (forecastFor(fc, day) * after) / (b - a);
+      } else {
+        const overlap = Math.min(b, t1) - Math.max(a, t0);
+        if (overlap > 0) forecast += (forecastFor(fc, day) * overlap) / (b - a);
       }
-      const overlap = Math.min(b, t1) - Math.max(a, t0);
-      if (overlap > 0) total += rate * overlap;
     }
-    return total;
+    return [actual, forecast];
   };
-  // Sales so far that follow straight on from the last whole day (else null).
+  const soldBetween = (key, fc, t0, t1) => { const [a, f] = soldSplit(key, fc, t0, t1); return a + f; };
+  // How far sales are in: the latest sales so far, following on day by day from the last
+  // whole day (else null).
   const partAt = (key, fc) => {
-    const p = partial.get(key);
-    return p && (!fc || p.day === shiftDay(fc.last, 1)) ? p.as_at : null;
+    const pd = partial.get(key);
+    if (!pd) return null;
+    if (!fc) return Math.max(...[...pd.values()].map((p) => p.as_at));
+    let at = null;
+    for (let day = shiftDay(fc.last, 1); pd.has(day); day = shiftDay(day, 1)) at = pd.get(day).as_at;
+    return at;
   };
   // The first moment from `t0` (level `level0`) when the level falls to `target`, or null.
   const whenLevel = (key, fc, t0, level0, target) => {
@@ -1744,15 +1781,12 @@ async function runoutBoard(env, companyId) {
         let deliveredSince = 0;
         for (const t of g.tanks) {
           const share = capacity ? t.capacity / capacity : 1;
-          const sold = soldBetween(key, fc, t.dip.at, now) * share;
-          const into = drops.filter((d) => d.delivered_at > t.dip.at).reduce((a, d) => a + d.litres, 0) * share;
+          const [a, f] = soldSplit(key, fc, t.dip.at, now);
+          const into = drops.filter((d) => d.delivered_at > t.dip.at).reduce((s, d) => s + d.litres, 0) * share;
           deliveredSince += into;
-          level += t.dip.litres - sold + into;
-          // Sales up to here are actual figures; after it, forecast.
-          const actualTo = g.sales_part_at ?? (fc ? startOf(shiftDay(fc.last, 1)) : t.dip.at);
-          const a = soldBetween(key, fc, t.dip.at, Math.min(now, Math.max(t.dip.at, actualTo))) * share;
-          soldActual += a;
-          soldForecast += sold - a;
+          level += t.dip.litres - (a + f) * share + into;
+          soldActual += a * share;
+          soldForecast += f * share;
         }
         g.dip_litres = g.tanks.reduce((a, t) => a + t.dip.litres, 0);
         g.dip_at = Math.min(...g.tanks.map((t) => t.dip.at));
