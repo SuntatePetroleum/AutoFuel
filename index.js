@@ -286,6 +286,33 @@ const MIGRATIONS = [
     `ALTER TABLE sales_partial_v8 RENAME TO sales_partial`,
     `CREATE INDEX IF NOT EXISTS idx_sales_partial_company_day ON sales_partial(company_id, day)`,
   ],
+  // v9: drivers complete each drop themselves and upload the paperwork; every dip is checked
+  // against what the sales say it should read.
+  [
+    `ALTER TABLE settings ADD COLUMN dip_check_l INTEGER NOT NULL DEFAULT 500`,
+    `ALTER TABLE settings ADD COLUMN paperwork_keep_days INTEGER NOT NULL DEFAULT 7`,
+    // Which drops of a run are done: {"<site_id>": {"at": ms, "by": user id, "by_name": "…"}}.
+    `ALTER TABLE runs ADD COLUMN progress TEXT`,
+    // The run an after-delivery dip was taken on.
+    `ALTER TABLE dips ADD COLUMN run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL`,
+    `CREATE TABLE IF NOT EXISTS paperwork (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      company_id INTEGER NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+      run_id INTEGER REFERENCES runs(id) ON DELETE SET NULL,
+      site_id INTEGER REFERENCES sites(id) ON DELETE SET NULL,
+      uploaded_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+      uploaded_at INTEGER NOT NULL,
+      filename TEXT NOT NULL,
+      content_type TEXT,
+      size INTEGER NOT NULL,
+      storage TEXT NOT NULL CHECK (storage IN ('r2', 'db')),
+      object_key TEXT,
+      data TEXT
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_paperwork_company ON paperwork(company_id, uploaded_at)`,
+    `CREATE INDEX IF NOT EXISTS idx_paperwork_run ON paperwork(run_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_dips_run ON dips(run_id)`,
+  ],
 ];
 
 let schemaVersionSeen = 0;
@@ -784,6 +811,8 @@ const SETTINGS_FIELDS = {
   holiday_region: { type: 'text', options: ['ACT', 'NSW', 'NT', 'QLD', 'SA', 'TAS', 'VIC', 'WA', 'None'], label: 'Public holiday calendar' },
   timezone: { type: 'text', max: 60, label: 'Time zone' },
   dip_stale_hours: { type: 'num', min: 1, max: 720, label: 'Dip out of date after' },
+  dip_check_l: { type: 'int', min: 0, max: 100000, label: 'Flag a dip that’s off by more than' },
+  paperwork_keep_days: { type: 'int', min: 1, max: 3650, label: 'Keep paperwork for' },
   mass_margin_kg: { type: 'int', min: 0, max: 5000, label: 'Weight margin' },
 };
 
@@ -1255,11 +1284,12 @@ function overCapacity(tank, litres) {
 }
 
 // A second reading for the same tank at the same minute replaces the first.
-function saveDip(env, companyId, userId, tankId, litres, takenAt, source) {
+function saveDip(env, companyId, userId, tankId, litres, takenAt, source, runId = null) {
   return env.DB.prepare(
-    `INSERT INTO dips (company_id, tank_id, litres, taken_at, source, entered_by) VALUES (?, ?, ?, ?, ?, ?)
-     ON CONFLICT(tank_id, taken_at) DO UPDATE SET litres = excluded.litres, source = excluded.source, entered_by = excluded.entered_by`
-  ).bind(companyId, tankId, litres, takenAt, source, userId);
+    `INSERT INTO dips (company_id, tank_id, litres, taken_at, source, entered_by, run_id) VALUES (?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(tank_id, taken_at) DO UPDATE SET litres = excluded.litres, source = excluded.source, entered_by = excluded.entered_by,
+       run_id = excluded.run_id`
+  ).bind(companyId, tankId, litres, takenAt, source, userId, runId);
 }
 
 async function latestDips(env, companyId) {
@@ -1278,7 +1308,7 @@ async function latestDips(env, companyId) {
 
 async function dipHistory(env, companyId, tankId) {
   if (!tankId) throw new HttpError(400, 'Choose a tank.');
-  const tank = await env.DB.prepare('SELECT id FROM tanks WHERE id = ? AND company_id = ?').bind(tankId, companyId).first();
+  const tank = (await companyTanks(env, companyId)).find((t) => t.id === tankId);
   if (!tank) throw new HttpError(404, 'That tank was not found.');
   const { results } = await env.DB.prepare(
     `SELECT d.id, d.litres, d.taken_at, d.source, u.name AS entered_by_name
@@ -1287,6 +1317,26 @@ async function dipHistory(env, companyId, tankId) {
   )
     .bind(tankId, companyId)
     .all();
+  // Each dip against what it should have read, going from the one before it.
+  if (results.length > 1) {
+    const settings = await getSettings(env, companyId);
+    const oldestAt = Math.max(results[results.length - 1].taken_at, results[0].taken_at - 120 * 86400000);
+    const only = { site_id: tank.site_id, grade_id: tank.grade_id };
+    const [model, { results: drops }, { results: sameGrade }] = await Promise.all([
+      salesModel(env, companyId, settings, modelFrom(settings, oldestAt), Date.now(), only),
+      env.DB.prepare('SELECT litres, delivered_at FROM deliveries WHERE company_id = ? AND site_id = ? AND grade_id = ? AND delivered_at >= ?')
+        .bind(companyId, tank.site_id, tank.grade_id, oldestAt).all(),
+      env.DB.prepare('SELECT capacity_l FROM tanks WHERE company_id = ? AND site_id = ? AND grade_id = ? AND active = 1').bind(companyId, tank.site_id, tank.grade_id).all(),
+    ]);
+    const capacity = sameGrade.reduce((a, t) => a + t.capacity_l, 0);
+    const share = capacity && tank.active ? tank.capacity_l / capacity : 1;
+    const key = `${tank.site_id}|${tank.grade_id}`;
+    for (let i = 0; i < results.length - 1; i++) {
+      if (results[i].taken_at < oldestAt) break;
+      const e = expectedLevel(model, key, share, results[i + 1], results[i].taken_at, drops);
+      if (e) Object.assign(results[i], { expected: Math.round(e.level), reported: checkable(e.sold, e.forecast) });
+    }
+  }
   return results;
 }
 
@@ -1627,39 +1677,21 @@ function buildForecast(history, lookbackWeeks) {
 
 const forecastFor = (fc, day) => (fc ? fc.level * fc.shape[weekdayOf(day)] : 0);
 
-async function runoutBoard(env, companyId) {
-  const settings = await getSettings(env, companyId);
+// Sales for one company as a model: whole days uploaded, sales so far on days not yet
+// whole, forecasts, and the litres sold between any two moments. Loads sales from `from`
+// (a day). Shared by the run-out board and the dip checks.
+async function salesModel(env, companyId, settings, from, now = Date.now(), only = null) {
   const tz = settings.timezone;
-  const now = Date.now();
-  const today = localDay(now, tz);
-  const HORIZON_DAYS = 30;
-
-  const [{ results: sites }, { results: tanks }, latest] = await Promise.all([
-    env.DB.prepare('SELECT id, name, code FROM sites WHERE company_id = ? AND active = 1 ORDER BY name').bind(companyId).all(),
-    env.DB.prepare(
-      `SELECT t.id, t.site_id, t.grade_id, t.name, t.capacity_l, g.code AS grade_code, g.name AS grade_name, g.sort_order
-       FROM tanks t JOIN grades g ON g.id = t.grade_id WHERE t.company_id = ? AND t.active = 1`
-    ).bind(companyId).all(),
-    latestDips(env, companyId),
-  ]);
-  // Sales back to the start of the forecast window, or the oldest dip if that's earlier.
-  const oldestDip = latest.length ? localDay(Math.min(...latest.map((d) => d.taken_at)), tz) : today;
-  const windowStart = shiftDay(today, -(7 * settings.lookback_weeks + 14));
-  const from = oldestDip < windowStart ? oldestDip : windowStart;
+  // Optionally just one site and grade.
+  const one = only ? ' AND site_id = ? AND grade_id = ?' : '';
+  const args = only ? [companyId, from, only.site_id, only.grade_id] : [companyId, from];
   const [{ results: sales }, { results: partialRows }] = await Promise.all([
     env.DB.prepare(
       `SELECT d.site_id, d.grade_id, d.day, d.litres, g.code AS grade_code, g.name AS grade_name
-       FROM sales_daily d JOIN grades g ON g.id = d.grade_id WHERE d.company_id = ? AND d.day >= ?`
-    ).bind(companyId, from).all(),
-    env.DB.prepare('SELECT site_id, grade_id, day, litres, as_at FROM sales_partial WHERE company_id = ? AND day >= ?').bind(companyId, from).all(),
+       FROM sales_daily d JOIN grades g ON g.id = d.grade_id WHERE d.company_id = ? AND d.day >= ?${one.replace(/ (site_id|grade_id)/g, ' d.$1')}`
+    ).bind(...args).all(),
+    env.DB.prepare(`SELECT site_id, grade_id, day, litres, as_at FROM sales_partial WHERE company_id = ? AND day >= ?${one}`).bind(...args).all(),
   ]);
-  const dipOf = new Map(latest.map((d) => [d.tank_id, d]));
-  // Deliveries recorded since the oldest dip, from runs marked done.
-  const { results: delivered } = await env.DB.prepare(
-    'SELECT site_id, grade_id, litres, delivered_at FROM deliveries WHERE company_id = ? AND delivered_at >= ?'
-  )
-    .bind(companyId, latest.length ? Math.min(...latest.map((d) => d.taken_at)) : now)
-    .all();
   const hist = new Map();
   const gradeInfo = new Map();
   for (const s of sales) {
@@ -1677,10 +1709,15 @@ async function runoutBoard(env, companyId) {
     if (!partial.has(key)) partial.set(key, new Map());
     partial.get(key).set(p.day, p);
   }
+  const fcs = new Map();
+  const fcFor = (key) => {
+    if (!fcs.has(key)) fcs.set(key, hist.has(key) ? buildForecast(hist.get(key), settings.lookback_weeks) : null);
+    return fcs.get(key);
+  };
 
-  // Start-of-day times in the company's time zone, so sales spread evenly through each day.
-  // Day boundaries in the company's zone. Where the zone's offset doesn't change over the
-  // period the board looks at (no daylight saving, as in Queensland), this is arithmetic.
+  // Day boundaries in the company's zone, so sales spread evenly through each day. Where
+  // the zone's offset doesn't change over the period (no daylight saving, as in
+  // Queensland), this is arithmetic.
   const offsets = [-200, -100, -40, 0, 40].map((d) => zoneOffset(now + d * 86400000, tz));
   const fixed = offsets.every((o) => o === offsets[0]) ? offsets[0] : null;
   const dayStart = new Map();
@@ -1736,11 +1773,11 @@ async function runoutBoard(env, companyId) {
     return at;
   };
   // The first moment from `t0` (level `level0`) when the level falls to `target`, or null.
-  const whenLevel = (key, fc, t0, level0, target) => {
+  const whenLevel = (key, fc, t0, level0, target, horizonDays = 30) => {
     if (level0 <= target) return t0;
     let level = level0;
     let t = t0;
-    for (let day = dayOf(t0), n = 0; n <= HORIZON_DAYS; day = shiftDay(day, 1), n++) {
+    for (let day = dayOf(t0), n = 0; n <= horizonDays; day = shiftDay(day, 1), n++) {
       const b = startOf(shiftDay(day, 1));
       const rate = litresPerDay(key, fc, day) / (b - startOf(day));
       const end = level - rate * (b - t);
@@ -1750,6 +1787,74 @@ async function runoutBoard(env, companyId) {
     }
     return null;
   };
+  return { hist, partial, gradeInfo, fcFor, startOf, dayOf, litresPerDay, soldSplit, soldBetween, partAt, whenLevel };
+}
+
+// The first day of sales a model needs: the forecast window, or the oldest dip if earlier.
+function modelFrom(settings, oldestAt) {
+  const today = localDay(Date.now(), settings.timezone);
+  const windowStart = shiftDay(today, -(7 * settings.lookback_weeks + 14));
+  const oldest = localDay(oldestAt, settings.timezone);
+  return oldest < windowStart ? oldest : windowStart;
+}
+
+// The longest gap between two dips that's still compared: past this, too much of the
+// change is forecast for the comparison to mean much.
+const DIP_CHECK_MAX_MS = 31 * 86400000;
+
+// What a tank should have read at `at`, going from an earlier dip: that dip, less its share
+// of the grade's sales since, plus its share of deliveries since. Null without sales.
+// `forecast` is how much of the sales in between were forecast rather than reported.
+function expectedLevel(model, key, share, prev, at, drops) {
+  const fc = model.fcFor(key);
+  if (!fc || !prev || at <= prev.taken_at || at - prev.taken_at > DIP_CHECK_MAX_MS) return null;
+  const into = drops.filter((d) => d.delivered_at > prev.taken_at && d.delivered_at <= at).reduce((a, d) => a + d.litres, 0);
+  const [actual, forecast] = model.soldSplit(key, fc, prev.taken_at, at);
+  return { level: prev.litres - (actual + forecast) * share + into * share, sold: (actual + forecast) * share, forecast: forecast * share };
+}
+
+// Only flag a dip when most of the sales since the dip before were reported, not forecast.
+const checkable = (sold, forecast) => forecast <= Math.max(200, 0.25 * sold);
+
+async function runoutBoard(env, companyId) {
+  const settings = await getSettings(env, companyId);
+  const tz = settings.timezone;
+  const now = Date.now();
+  const today = localDay(now, tz);
+  const HORIZON_DAYS = 30;
+
+  const [{ results: sites }, { results: tanks }, { results: recent }] = await Promise.all([
+    env.DB.prepare('SELECT id, name, code FROM sites WHERE company_id = ? AND active = 1 ORDER BY name').bind(companyId).all(),
+    env.DB.prepare(
+      `SELECT t.id, t.site_id, t.grade_id, t.name, t.capacity_l, g.code AS grade_code, g.name AS grade_name, g.sort_order
+       FROM tanks t JOIN grades g ON g.id = t.grade_id WHERE t.company_id = ? AND t.active = 1`
+    ).bind(companyId).all(),
+    // Each tank's latest dip and the one before it (for the dip check).
+    env.DB.prepare(
+      `SELECT tank_id, litres, taken_at, source, rn FROM (
+         SELECT d.tank_id, d.litres, d.taken_at, d.source,
+                ROW_NUMBER() OVER (PARTITION BY d.tank_id ORDER BY d.taken_at DESC, d.id DESC) AS rn
+         FROM dips d WHERE d.company_id = ?
+       ) WHERE rn <= 2`
+    ).bind(companyId).all(),
+  ]);
+  const latest = recent.filter((d) => d.rn === 1);
+  const prevOf = new Map(recent.filter((d) => d.rn === 2 && now - d.taken_at <= DIP_CHECK_MAX_MS + 86400000).map((d) => [d.tank_id, d]));
+  // Sales back to the start of the forecast window, or the oldest dip used if that's earlier.
+  const used = [...latest, ...prevOf.values()].map((d) => d.taken_at);
+  const oldestAt = used.length ? Math.min(...used) : now;
+  const oldestDip = localDay(oldestAt, tz);
+  const windowStart = shiftDay(today, -(7 * settings.lookback_weeks + 14));
+  const from = oldestDip < windowStart ? oldestDip : windowStart;
+  const model = await salesModel(env, companyId, settings, from, now);
+  const { hist, gradeInfo, startOf, litresPerDay, soldSplit, soldBetween, partAt, whenLevel } = model;
+  const dipOf = new Map(latest.map((d) => [d.tank_id, d]));
+  // Deliveries recorded since the oldest dip used, from runs marked done.
+  const { results: delivered } = await env.DB.prepare(
+    'SELECT site_id, grade_id, litres, delivered_at FROM deliveries WHERE company_id = ? AND delivered_at >= ?'
+  )
+    .bind(companyId, oldestAt)
+    .all();
 
   const out = [];
   for (const site of sites) {
@@ -1758,14 +1863,16 @@ async function runoutBoard(env, companyId) {
     for (const gradeId of [...new Set(mine.map((t) => t.grade_id))]) {
       const gt = mine.filter((t) => t.grade_id === gradeId);
       const key = `${site.id}|${gradeId}`;
-      const h = hist.get(key);
-      const fc = h ? buildForecast(h, settings.lookback_weeks) : null;
+      const fc = model.fcFor(key);
       const capacity = gt.reduce((a, t) => a + t.capacity_l, 0);
       const avg = fc ? fc.level : 0;
       const g = {
         grade_id: gradeId, grade_code: gt[0].grade_code, grade_name: gt[0].grade_name, sort: gt[0].sort_order,
         capacity, avg_daily: Math.round(avg),
-        tanks: gt.map((t) => ({ id: t.id, name: t.name, capacity: t.capacity_l, dip: dipOf.get(t.id) ? { litres: dipOf.get(t.id).litres, at: dipOf.get(t.id).taken_at } : null })),
+        tanks: gt.map((t) => {
+          const d = dipOf.get(t.id);
+          return { id: t.id, name: t.name, capacity: t.capacity_l, dip: d ? { litres: d.litres, at: d.taken_at, source: d.source } : null };
+        }),
         sales_to: fc ? fc.last : null,
         sales_part_at: partAt(key, fc),
         fill_to: Math.max(0, Math.round(capacity * settings.safe_fill_pct - settings.overfill_margin_l)),
@@ -1785,6 +1892,29 @@ async function runoutBoard(env, companyId) {
         parts.set(t.id, p);
         // The tank's estimated level now (needs sales to work from).
         if (fc) t.est = { level: Math.max(0, Math.round(p.level)), sold: Math.round(p.actual + p.forecast), sold_estimated: Math.round(p.forecast), delivered: Math.round(into) };
+        // Dip check: what the latest dip should have read, going from the dip before it.
+        const prev = prevOf.get(t.id);
+        const e = expectedLevel(model, key, share, prev, t.dip.at, drops);
+        if (e) Object.assign(t.dip, { expected: Math.round(e.level), prev_at: prev.taken_at, prev_litres: prev.litres, sold_between: e.sold, forecast_between: e.forecast });
+      }
+      // The grade as a whole, when its tanks were dipped together: a delivery or the sales
+      // may not split between tanks of the same grade by capacity.
+      if (g.tanks.length && g.tanks.every((t) => t.dip && t.dip.expected != null)) {
+        const ats = g.tanks.map((t) => t.dip.at);
+        if (Math.max(...ats) - Math.min(...ats) <= 30 * 60000) {
+          const dipped = g.tanks.reduce((a, t) => a + t.dip.litres, 0);
+          const expected = g.tanks.reduce((a, t) => a + t.dip.expected, 0);
+          const sold = g.tanks.reduce((a, t) => a + t.dip.sold_between, 0);
+          const forecast = g.tanks.reduce((a, t) => a + t.dip.forecast_between, 0);
+          const reported = checkable(sold, forecast);
+          g.check = {
+            at: Math.max(...ats), dipped, expected, diff: dipped - expected,
+            from: Math.min(...g.tanks.map((t) => t.dip.prev_at)),
+            after_delivery: g.tanks.some((t) => t.dip.source === 'delivery'),
+            sold: Math.round(sold), estimated: Math.round(forecast), reported,
+            flagged: reported && Math.abs(dipped - expected) > settings.dip_check_l,
+          };
+        }
       }
       if (g.tanks.every((t) => t.dip)) {
         let level = 0;
@@ -1866,6 +1996,10 @@ async function runoutBoard(env, companyId) {
       if (g.state === 'no_recent_sales') warnings.push(`No ${g.grade_code} sales in the last two weeks of uploads.`);
       if (g.dip_at && now - g.dip_at > settings.dip_stale_hours * 3600000) warnings.push(`${g.grade_code} is worked out from a dip ${Math.round((now - g.dip_at) / 3600000)} hours old.`);
       if (g.level != null && g.dip_litres > g.capacity) warnings.push(`${g.grade_code}’s latest dip is more than its listed capacity.`);
+      if (g.check && g.check.flagged) {
+        const off = Math.abs(g.check.diff).toLocaleString('en-AU');
+        warnings.push(`${g.grade_code}’s latest dip was ${off} L ${g.check.diff < 0 ? 'less' : 'more'} than the sales${g.check.after_delivery ? ' and delivery' : ''} since the dip before say it should be. Check the dip, the sales, or for a delivery that wasn’t recorded.`);
+      }
     }
     const salesTo = groups.map((g) => g.sales_to).filter(Boolean).sort();
     // How far the site's sales are in, going by the grade that's furthest behind.
@@ -1879,7 +2013,10 @@ async function runoutBoard(env, companyId) {
       status = hrs <= 0 ? 'overdue' : hrs <= 24 ? 'today' : hrs <= 48 ? 'soon' : 'ok';
     } else if (live.length) status = 'ok';
 
-    for (const g of groups) { delete g.key; delete g.fc; delete g.sort; }
+    for (const g of groups) {
+      delete g.key; delete g.fc; delete g.sort;
+      for (const t of g.tanks) if (t.dip && t.dip.sold_between != null) { delete t.dip.sold_between; delete t.dip.forecast_between; }
+    }
     out.push({
       id: site.id, name: site.name, status, deliver_by: deliverBy, window_opens: opens,
       room_now: live.reduce((a, g) => a + g.room_now, 0),
@@ -1904,7 +2041,7 @@ async function runoutBoard(env, companyId) {
 
 async function listRuns(env, companyId, from, to) {
   const { results } = await env.DB.prepare(
-    `SELECT r.id, r.run_date, r.truck_id, r.driver_id, r.status, r.plan, r.created_at, r.updated_at,
+    `SELECT r.id, r.run_date, r.truck_id, r.driver_id, r.status, r.plan, r.progress, r.created_at, r.updated_at,
             t.name AS truck_name, t.rego AS truck_rego, d.name AS driver_name, u.name AS created_by_name
      FROM runs r LEFT JOIN trucks t ON t.id = r.truck_id LEFT JOIN drivers d ON d.id = r.driver_id
      LEFT JOIN users u ON u.id = r.created_by
@@ -1918,7 +2055,21 @@ async function listRuns(env, companyId, from, to) {
   )
     .bind(companyId, companyId, from, to)
     .all();
-  return results.map((r) => ({ ...r, plan: JSON.parse(r.plan), delivered: drops.filter((d) => d.run_id === r.id) }));
+  const ids = results.map((r) => r.id);
+  const inRuns = `(SELECT id FROM runs WHERE company_id = ? AND run_date BETWEEN ? AND ?)`;
+  const [{ results: afterDips }, { results: papers }] = ids.length ? await Promise.all([
+    env.DB.prepare(`SELECT d.run_id, d.tank_id, t.site_id, d.litres, d.taken_at FROM dips d JOIN tanks t ON t.id = d.tank_id
+      WHERE d.company_id = ? AND d.source = 'delivery' AND d.run_id IN ${inRuns}`).bind(companyId, companyId, from, to).all(),
+    env.DB.prepare(`SELECT p.id, p.run_id, p.site_id, p.filename, p.content_type, p.size, p.uploaded_at, u.name AS uploaded_by_name
+      FROM paperwork p LEFT JOIN users u ON u.id = p.uploaded_by WHERE p.company_id = ? AND p.run_id IN ${inRuns} ORDER BY p.uploaded_at`)
+      .bind(companyId, companyId, from, to).all(),
+  ]) : [{ results: [] }, { results: [] }];
+  return results.map((r) => ({
+    ...r, plan: JSON.parse(r.plan), progress: r.progress ? JSON.parse(r.progress) : {},
+    delivered: drops.filter((d) => d.run_id === r.id),
+    after_dips: afterDips.filter((d) => d.run_id === r.id),
+    paperwork: papers.filter((p) => p.run_id === r.id),
+  }));
 }
 
 // A run: one truck, one to three stops, and what goes in each compartment. Names are
@@ -2006,61 +2157,99 @@ async function updateRun(request, env, me, id) {
     .first();
   if (!res) throw new HttpError(404, 'That run was not found.');
   // Back to planned: what it delivered no longer counts. Dips taken stay, as real readings.
-  if (status === 'planned') await env.DB.prepare('DELETE FROM deliveries WHERE run_id = ? AND company_id = ?').bind(id, me.company_id).run();
+  if (status === 'planned') {
+    await env.DB.batch([
+      env.DB.prepare('DELETE FROM deliveries WHERE run_id = ? AND company_id = ?').bind(id, me.company_id),
+      env.DB.prepare('UPDATE runs SET progress = NULL WHERE id = ? AND company_id = ?').bind(id, me.company_id),
+    ]);
+  }
   return json({ ok: true });
 }
 
 // A run marked done: the litres that went into each site's grades (from the load, or as
 // changed from the docket), and any dips taken after the drop. Until the next dip, the
 // board adds these deliveries to the level.
+// What completing one drop writes: its deliveries (replacing any recorded before) and the
+// after-delivery dips entered. Shared by the office's "done" and a driver's drop.
+async function dropContext(env, cid, id) {
+  const run = await env.DB.prepare('SELECT id, plan, progress FROM runs WHERE id = ? AND company_id = ?').bind(id, cid).first();
+  if (!run) throw new HttpError(404, 'That run was not found.');
+  const tanks = new Map((await companyTanks(env, cid)).map((t) => [t.id, t]));
+  const { results: gradeRows } = await env.DB.prepare('SELECT id, code FROM grades WHERE company_id = ?').bind(cid).all();
+  return { run, plan: JSON.parse(run.plan), progress: run.progress ? JSON.parse(run.progress) : {}, tanks, grades: new Map(gradeRows.map((g) => [g.id, g])) };
+}
+
+function dropStatements(env, ctx, me, runId, st, now) {
+  const cid = me.company_id;
+  const stop = ctx.plan.stops.find((p) => p.site_id === Number(st.site_id));
+  if (!stop) throw new HttpError(400, 'That drop isn’t part of this run.');
+  const at = Number(st.at);
+  if (!Number.isFinite(at)) throw new HttpError(400, `${stop.site_name}: choose when it was delivered.`);
+  if (at > now + 15 * 60000) throw new HttpError(400, `${stop.site_name}: the delivery time is in the future.`);
+  if (at < now - 14 * 86400000) throw new HttpError(400, `${stop.site_name}: the delivery time is more than two weeks ago.`);
+  const stmts = [env.DB.prepare('DELETE FROM deliveries WHERE run_id = ? AND site_id = ? AND company_id = ?').bind(runId, stop.site_id, cid)];
+  const warnings = [];
+  for (const g of Array.isArray(st.grades) ? st.grades : []) {
+    const grade = ctx.grades.get(Number(g.grade_id));
+    if (!grade) throw new HttpError(400, `${stop.site_name}: that grade was not found.`);
+    const litres = Number(g.litres);
+    if (!Number.isFinite(litres) || litres < 0 || litres > 200000) throw new HttpError(400, `${stop.site_name} ${grade.code}: enter the litres delivered.`);
+    if (litres > 0) {
+      stmts.push(
+        env.DB.prepare(
+          'INSERT INTO deliveries (company_id, run_id, site_id, grade_id, litres, delivered_at, entered_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
+        ).bind(cid, runId, stop.site_id, grade.id, Math.round(litres), at, me.id, now)
+      );
+    }
+  }
+  for (const d of Array.isArray(st.dips) ? st.dips : []) {
+    if (d.litres === null || d.litres === undefined || String(d.litres).trim() === '') continue;
+    const tank = ctx.tanks.get(Number(d.tank_id));
+    if (!tank || tank.site_id !== stop.site_id) throw new HttpError(400, `${stop.site_name}: one of those tanks isn’t at this site.`);
+    const litres = cleanLitres(d.litres, `${stop.site_name} ${tank.name}`);
+    const warning = overCapacity(tank, litres);
+    if (warning) warnings.push(warning);
+    // Taken just after the drop, so it replaces the delivery in the level. An after-dip
+    // entered again for this run replaces the earlier one.
+    stmts.push(env.DB.prepare("DELETE FROM dips WHERE run_id = ? AND tank_id = ? AND source = 'delivery' AND company_id = ?").bind(runId, tank.id, cid));
+    stmts.push(saveDip(env, cid, me.id, tank.id, litres, Math.min(at + 60000, now + 60000), 'delivery', runId));
+  }
+  ctx.progress[stop.site_id] = { at, by: me.id, by_name: me.name };
+  return { stmts, warnings };
+}
+
+// The office marks a whole run done, with what each drop delivered.
 async function completeRun(request, env, me, id) {
   const body = await readJson(request);
   const cid = me.company_id;
-  const run = await env.DB.prepare('SELECT id, plan FROM runs WHERE id = ? AND company_id = ?').bind(id, cid).first();
-  if (!run) throw new HttpError(404, 'That run was not found.');
-  const plan = JSON.parse(run.plan);
+  const ctx = await dropContext(env, cid, id);
   const stopsIn = Array.isArray(body.stops) ? body.stops : [];
   if (stopsIn.length > 3) throw new HttpError(400, 'A run has at most three stops.');
-  const tanks = new Map((await companyTanks(env, cid)).map((t) => [t.id, t]));
-  const { results: gradeRows } = await env.DB.prepare('SELECT id, code FROM grades WHERE company_id = ?').bind(cid).all();
-  const grades = new Map(gradeRows.map((g) => [g.id, g]));
   const now = Date.now();
   const stmts = [env.DB.prepare('DELETE FROM deliveries WHERE run_id = ? AND company_id = ?').bind(id, cid)];
   const warnings = [];
   for (const st of stopsIn) {
-    const stop = plan.stops.find((p) => p.site_id === Number(st.site_id));
-    if (!stop) throw new HttpError(400, 'A stop isn’t part of this run.');
-    const at = Number(st.at);
-    if (!Number.isFinite(at)) throw new HttpError(400, `${stop.site_name}: choose when it was delivered.`);
-    if (at > now + 15 * 60000) throw new HttpError(400, `${stop.site_name}: the delivery time is in the future.`);
-    if (at < now - 14 * 86400000) throw new HttpError(400, `${stop.site_name}: the delivery time is more than two weeks ago.`);
-    for (const g of Array.isArray(st.grades) ? st.grades : []) {
-      const grade = grades.get(Number(g.grade_id));
-      if (!grade) throw new HttpError(400, `${stop.site_name}: that grade was not found.`);
-      const litres = Number(g.litres);
-      if (!Number.isFinite(litres) || litres < 0 || litres > 200000) throw new HttpError(400, `${stop.site_name} ${grade.code}: enter the litres delivered.`);
-      if (litres > 0) {
-        stmts.push(
-          env.DB.prepare(
-            'INSERT INTO deliveries (company_id, run_id, site_id, grade_id, litres, delivered_at, entered_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)'
-          ).bind(cid, id, stop.site_id, grade.id, Math.round(litres), at, me.id, now)
-        );
-      }
-    }
-    for (const d of Array.isArray(st.dips) ? st.dips : []) {
-      if (d.litres === null || d.litres === undefined || String(d.litres).trim() === '') continue;
-      const tank = tanks.get(Number(d.tank_id));
-      if (!tank || tank.site_id !== stop.site_id) throw new HttpError(400, `${stop.site_name}: one of those tanks isn’t at this site.`);
-      const litres = cleanLitres(d.litres, `${stop.site_name} ${tank.name}`);
-      const warning = overCapacity(tank, litres);
-      if (warning) warnings.push(warning);
-      // Taken just after the drop, so it replaces the delivery in the level.
-      stmts.push(saveDip(env, cid, me.id, tank.id, litres, Math.min(at + 60000, now + 60000), 'delivery'));
-    }
+    const res = dropStatements(env, ctx, me, id, st, now);
+    stmts.push(...res.stmts.slice(1));
+    warnings.push(...res.warnings);
   }
-  stmts.push(env.DB.prepare("UPDATE runs SET status = 'done', updated_at = ? WHERE id = ? AND company_id = ?").bind(now, id, cid));
+  stmts.push(env.DB.prepare("UPDATE runs SET status = 'done', progress = ?, updated_at = ? WHERE id = ? AND company_id = ?").bind(JSON.stringify(ctx.progress), now, id, cid));
   await env.DB.batch(stmts);
   return json({ ok: true, warnings });
+}
+
+// A driver (or the office) records one drop. The run is done once every drop is in.
+async function completeDrop(request, env, me, id, siteId) {
+  const body = await readJson(request);
+  const cid = me.company_id;
+  const ctx = await dropContext(env, cid, id);
+  const now = Date.now();
+  const { stmts, warnings } = dropStatements(env, ctx, me, id, { ...body, site_id: siteId }, now);
+  const done = ctx.plan.stops.every((p) => ctx.progress[p.site_id]);
+  stmts.push(env.DB.prepare('UPDATE runs SET status = ?, progress = ?, updated_at = ? WHERE id = ? AND company_id = ?')
+    .bind(done ? 'done' : 'planned', JSON.stringify(ctx.progress), now, id, cid));
+  await env.DB.batch(stmts);
+  return json({ ok: true, done, warnings });
 }
 
 async function deleteRun(env, me, id) {
@@ -2309,6 +2498,164 @@ async function receiveEmail(message, env) {
   await env.DB.batch(stmts);
 }
 
+/* ------------------------------------------------------------ paperwork */
+// Photos and PDFs of delivery paperwork, uploaded when a drop is done. Kept in the PAPERWORK
+// R2 bucket when one is bound to the Worker, otherwise in the database, and deleted after
+// the company's keep period (a week unless changed in Settings).
+const PAPERWORK_MAX = 8_000_000; // bytes, in R2 (the app shrinks photos well below this)
+const PAPERWORK_DB_MAX = 1_400_000; // bytes, what fits in a database row
+const PAPERWORK_TYPES = /^(image\/(jpeg|png|webp|heic|heif|gif)|application\/pdf)$/i;
+
+async function prunePaperwork(env, companyId, keepDays) {
+  const cutoff = Date.now() - keepDays * 86400000;
+  const { results } = await env.DB.prepare('SELECT id, storage, object_key FROM paperwork WHERE company_id = ? AND uploaded_at < ? LIMIT 500')
+    .bind(companyId, cutoff).all();
+  if (!results.length) return 0;
+  const keys = results.filter((r) => r.storage === 'r2' && r.object_key).map((r) => r.object_key);
+  if (keys.length && env.PAPERWORK) await env.PAPERWORK.delete(keys);
+  await env.DB.prepare('DELETE FROM paperwork WHERE company_id = ? AND id IN (SELECT value FROM json_each(?))')
+    .bind(companyId, JSON.stringify(results.map((r) => r.id))).run();
+  return results.length;
+}
+
+// The file's bytes in the request body, with ?run_id=&site_id=&name=.
+async function uploadPaperwork(request, env, me, url) {
+  const cid = me.company_id;
+  const type = (request.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  if (!PAPERWORK_TYPES.test(type)) throw new HttpError(415, 'Upload a photo or a PDF.');
+  const max = env.PAPERWORK ? PAPERWORK_MAX : PAPERWORK_DB_MAX;
+  const tooBig = `That file is too large (over ${(max / 1e6).toFixed(1)} MB).`;
+  if (Number(request.headers.get('content-length')) > max) throw new HttpError(413, tooBig);
+  const runId = Number(url.searchParams.get('run_id')) || null;
+  const siteId = Number(url.searchParams.get('site_id')) || null;
+  if (runId && !(await env.DB.prepare('SELECT id FROM runs WHERE id = ? AND company_id = ?').bind(runId, cid).first())) throw new HttpError(404, 'That run was not found.');
+  if (siteId && !(await env.DB.prepare('SELECT id FROM sites WHERE id = ? AND company_id = ?').bind(siteId, cid).first())) throw new HttpError(404, 'That site was not found.');
+  const name = String(url.searchParams.get('name') || 'paperwork').replace(/[\\/\r\n"]/g, '_').trim().slice(0, 120) || 'paperwork';
+  const bytes = await request.arrayBuffer();
+  if (!bytes.byteLength) throw new HttpError(400, 'The file is empty.');
+  if (bytes.byteLength > max) throw new HttpError(413, tooBig);
+  const settings = await getSettings(env, cid);
+  await prunePaperwork(env, cid, settings.paperwork_keep_days);
+  let key = null;
+  let data = null;
+  if (env.PAPERWORK) {
+    key = `${cid}/${Date.now()}-${crypto.randomUUID()}`;
+    await env.PAPERWORK.put(key, bytes, { httpMetadata: { contentType: type } });
+  } else {
+    data = b64Big(new Uint8Array(bytes));
+  }
+  const row = await env.DB.prepare(
+    `INSERT INTO paperwork (company_id, run_id, site_id, uploaded_by, uploaded_at, filename, content_type, size, storage, object_key, data)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`
+  ).bind(cid, runId, siteId, me.id, Date.now(), name, type, bytes.byteLength, key ? 'r2' : 'db', key, data).first();
+  return json({ ok: true, id: row.id });
+}
+
+// R2 files come back as they are; database ones as base64 in JSON (the app turns them back
+// into a file), which saves the Worker decoding them.
+async function getPaperwork(env, me, id) {
+  const p = await env.DB.prepare('SELECT id, filename, content_type, storage, object_key, data FROM paperwork WHERE id = ? AND company_id = ?')
+    .bind(id, me.company_id).first();
+  if (!p) throw new HttpError(404, 'That paperwork isn’t kept any more.');
+  if (p.storage === 'db') return json({ filename: p.filename, content_type: p.content_type, data: p.data });
+  const obj = env.PAPERWORK ? await env.PAPERWORK.get(p.object_key) : null;
+  if (!obj) throw new HttpError(404, 'That paperwork isn’t kept any more.');
+  return new Response(obj.body, {
+    headers: {
+      'content-type': p.content_type || 'application/octet-stream',
+      'content-disposition': `inline; filename="${p.filename.replace(/[^\x20-\x7e]/g, '_')}"`,
+      'cache-control': 'private, max-age=3600',
+    },
+  });
+}
+
+async function deletePaperwork(env, me, id, isOffice) {
+  const p = await env.DB.prepare('SELECT id, uploaded_by, storage, object_key FROM paperwork WHERE id = ? AND company_id = ?').bind(id, me.company_id).first();
+  if (!p) throw new HttpError(404, 'That paperwork was not found.');
+  if (!isOffice && p.uploaded_by !== me.id) throw new HttpError(403, 'Only the office can delete someone else’s paperwork.');
+  if (p.storage === 'r2' && env.PAPERWORK) await env.PAPERWORK.delete(p.object_key);
+  await env.DB.prepare('DELETE FROM paperwork WHERE id = ? AND company_id = ?').bind(id, me.company_id).run();
+  return json({ ok: true });
+}
+
+/* ------------------------------------------------------------- drivers */
+// A driver's day: every run on the date (today unless ?date=), the tanks at each stop, and
+// the grades, so the app can show the load and take each drop.
+async function driverRuns(env, me, url) {
+  const settings = await getSettings(env, me.company_id);
+  const today = localDay(Date.now(), settings.timezone);
+  const asked = url.searchParams.get('date') || '';
+  const date = DAY_RE.test(asked) ? asked : today;
+  const runs = await listRuns(env, me.company_id, date, date);
+  const siteIds = new Set(runs.flatMap((r) => r.plan.stops.map((st) => st.site_id)));
+  const tanks = (await companyTanks(env, me.company_id))
+    .filter((t) => t.active && siteIds.has(t.site_id))
+    .map((t) => ({ id: t.id, name: t.name, site_id: t.site_id, grade_id: t.grade_id, grade_code: t.grade_code, capacity_l: t.capacity_l }));
+  const { results: grades } = await env.DB.prepare('SELECT id, code, name FROM grades WHERE company_id = ? ORDER BY sort_order, code').bind(me.company_id).all();
+  return json({ date, today, timezone: settings.timezone, keep_days: settings.paperwork_keep_days, can_upload: true, runs, tanks, grades });
+}
+
+// Recent drops for the office: what each delivered, the dips taken after it against what
+// they should have read, and the paperwork.
+async function recentDeliveries(env, me, url) {
+  const cid = me.company_id;
+  const settings = await getSettings(env, cid);
+  const days = Math.min(60, Math.max(1, Number(url.searchParams.get('days')) || 14));
+  const today = localDay(Date.now(), settings.timezone);
+  const runs = (await listRuns(env, cid, shiftDay(today, -days), today))
+    .filter((r) => Object.keys(r.progress).length || r.delivered.length || r.paperwork.length)
+    .reverse();
+  const dips = runs.flatMap((r) => r.after_dips);
+  const tanks = await companyTanks(env, cid);
+  const byTank = new Map(tanks.map((t) => [t.id, t]));
+  if (dips.length) {
+    const tankIds = [...new Set(dips.map((d) => d.tank_id))];
+    const oldest = Math.min(...dips.map((d) => d.taken_at)) - DIP_CHECK_MAX_MS;
+    const [{ results: earlier }, { results: drops }, model] = await Promise.all([
+      env.DB.prepare('SELECT tank_id, litres, taken_at FROM dips WHERE company_id = ? AND taken_at >= ? AND tank_id IN (SELECT value FROM json_each(?)) ORDER BY taken_at')
+        .bind(cid, oldest, JSON.stringify(tankIds)).all(),
+      env.DB.prepare('SELECT site_id, grade_id, litres, delivered_at FROM deliveries WHERE company_id = ? AND delivered_at >= ?').bind(cid, oldest).all(),
+      salesModel(env, cid, settings, modelFrom(settings, oldest)),
+    ]);
+    const capOf = (t) => tanks.filter((x) => x.active && x.site_id === t.site_id && x.grade_id === t.grade_id).reduce((a, x) => a + x.capacity_l, 0);
+    for (const d of dips) {
+      const t = byTank.get(d.tank_id);
+      if (!t) continue;
+      Object.assign(d, { tank_name: t.name, grade_id: t.grade_id, grade_code: t.grade_code, capacity: t.capacity_l });
+      const prev = earlier.filter((x) => x.tank_id === d.tank_id && x.taken_at < d.taken_at).pop();
+      const cap = capOf(t);
+      const share = cap && t.active ? t.capacity_l / cap : 1;
+      const e = expectedLevel(model, `${t.site_id}|${t.grade_id}`, share, prev, d.taken_at,
+        drops.filter((x) => x.site_id === t.site_id && x.grade_id === t.grade_id));
+      if (e) Object.assign(d, { expected: Math.round(e.level), prev_at: prev.taken_at, prev_litres: prev.litres, sold_between: Math.round(e.sold), forecast_between: Math.round(e.forecast) });
+    }
+  }
+  // Per grade at each drop, when every tank of the grade was dipped after it.
+  for (const r of runs) {
+    r.checks = [];
+    const groups = new Map();
+    for (const d of r.after_dips) {
+      if (d.grade_id == null) continue;
+      const k = `${d.site_id}|${d.grade_id}`;
+      if (!groups.has(k)) groups.set(k, []);
+      groups.get(k).push(d);
+    }
+    for (const [k, list] of groups) {
+      const [siteId, gradeId] = k.split('|').map(Number);
+      const all = tanks.filter((t) => t.active && t.site_id === siteId && t.grade_id === gradeId).length;
+      if (list.length < all || list.some((d) => d.expected == null)) continue;
+      const dipped = list.reduce((a, d) => a + d.litres, 0);
+      const expected = list.reduce((a, d) => a + d.expected, 0);
+      const sold = list.reduce((a, d) => a + d.sold_between, 0);
+      const estimated = list.reduce((a, d) => a + d.forecast_between, 0);
+      const reported = checkable(sold, estimated);
+      r.checks.push({ site_id: siteId, grade_id: gradeId, grade_code: list[0].grade_code, dipped, expected, diff: dipped - expected,
+        sold, estimated, reported, flagged: reported && Math.abs(dipped - expected) > settings.dip_check_l });
+    }
+  }
+  return json({ days, threshold: settings.dip_check_l, keep_days: settings.paperwork_keep_days, storage: env.PAPERWORK ? 'r2' : 'db', runs });
+}
+
 /* ---------------------------------------------------------------- router */
 
 async function handleApi(request, env, url) {
@@ -2337,6 +2684,15 @@ async function handleApi(request, env, url) {
 
   if (path === '/api/me' && method === 'GET') return json(me);
   if (path === '/api/me/password' && method === 'POST') return changeOwnPassword(request, env, me);
+
+  // Drivers (and the office): the day's runs, finishing each drop, and its paperwork.
+  if (path === '/api/driver/runs' && method === 'GET') return driverRuns(env, me, url);
+  const dropDone = path.match(/^\/api\/runs\/(\d+)\/drops\/(\d+)\/complete$/);
+  if (dropDone && method === 'POST') return completeDrop(request, env, me, Number(dropDone[1]), Number(dropDone[2]));
+  if (path === '/api/paperwork' && method === 'POST') return uploadPaperwork(request, env, me, url);
+  const paperMatch = path.match(/^\/api\/paperwork\/(\d+)$/);
+  if (paperMatch && method === 'GET') return getPaperwork(env, me, Number(paperMatch[1]));
+  if (paperMatch && method === 'DELETE') return deletePaperwork(env, me, Number(paperMatch[1]), canRead);
 
   if (!canRead) throw new HttpError(403, 'Your account doesn’t have access to setup data.');
 
@@ -2385,6 +2741,7 @@ async function handleApi(request, env, url) {
     return json(f);
   }
   if (runMatch && method === 'DELETE') return deleteRun(env, me, Number(runMatch[1]));
+  if (path === '/api/deliveries' && method === 'GET') return recentDeliveries(env, me, url);
 
   // Dips: admins and dispatchers can read and record them.
   if (path === '/api/dips/latest' && method === 'GET') return json(await latestDips(env, me.company_id));
@@ -2437,7 +2794,7 @@ const PAGE_HEADERS = {
   'referrer-policy': 'same-origin',
   'content-security-policy':
     "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
-    "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+    "img-src 'self' data: blob:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
 };
 
 export default {

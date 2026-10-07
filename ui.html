@@ -98,6 +98,19 @@
   .level span { position: absolute; left: 0; top: 0; display: block; height: 100%; background: var(--accent); border-radius: 999px; }
   .level span.was { opacity: 0.25; }
   .dip-was { color: var(--muted); font-size: 13px; margin-top: 2px; white-space: normal; }
+  .dip-check { font-size: 13px; margin-top: 2px; white-space: normal; }
+  .linkish { background: none; border: 0; padding: 0; color: var(--accent-text); text-decoration: underline; cursor: pointer; font: inherit; }
+  .drv-drop { border-top: 1px solid var(--border); padding-bottom: 14px; }
+  .drop-load { margin: 2px 16px 8px; width: calc(100% - 32px); }
+  .drop-done { margin: 0 16px 8px; }
+  .drop-done .muted { color: inherit; opacity: .8; }
+  .paper-list { display: flex; gap: 6px; flex-wrap: wrap; padding: 0 16px 8px; }
+  .drop-actions { display: flex; gap: 8px; flex-wrap: wrap; padding: 0 16px; }
+  .drop-h { margin: 18px 0 6px; font-size: 15px; }
+  .pw-view img { max-width: 100%; border-radius: 8px; display: block; }
+  .drop-card .drop-body { padding: 12px 16px; display: grid; gap: 10px; }
+  .drop-card .delivered { display: flex; gap: 6px 14px; flex-wrap: wrap; font-size: 14px; }
+  td.flag { color: var(--warn); font-weight: 600; }
   .nw { white-space: nowrap; }
   .dip-side { max-width: 58%; }
   .level.over span { background: var(--warn); }
@@ -501,9 +514,9 @@ function readFields(form, fields) {
   return out;
 }
 
-function openDialog({ title, sub, body, onSave, onDelete, saveLabel = 'Save', deleteLabel = 'Delete', readOnly, anyRole }) {
+function openDialog({ title, sub, body, onSave, onDelete, saveLabel = 'Save', deleteLabel = 'Delete', readOnly, anyRole, anyone }) {
   const dlg = $('#dlg');
-  const canEdit = (isAdmin() || (anyRole && canDip())) && !readOnly;
+  const canEdit = (isAdmin() || (anyRole && canDip()) || anyone) && !readOnly;
   dlg.innerHTML = `
     <form method="dialog" novalidate>
       <div class="dlg-head"><h2>${esc(title)}</h2>${sub ? `<div class="muted" style="font-size:13px">${esc(sub)}</div>` : ''}</div>
@@ -636,7 +649,7 @@ function wireCompartments() {
 
 /* -------------------------------------------------------------- views */
 const NAV = [
-  ['board', 'Board'], ['plan', 'Plan'], ['sites', 'Sites'], ['dips', 'Dips'], ['sales', 'Sales'], ['tanks', 'Tanks'], ['trucks', 'Trucks'], ['grades', 'Grades'],
+  ['board', 'Board'], ['plan', 'Plan'], ['deliveries', 'Deliveries'], ['sites', 'Sites'], ['dips', 'Dips'], ['sales', 'Sales'], ['tanks', 'Tanks'], ['trucks', 'Trucks'], ['grades', 'Grades'],
   ['terminals', 'Terminals'], ['drivers', 'Drivers'], ['settings', 'Settings'], ['import', 'Import'], ['users', 'Users', true],
 ];
 
@@ -823,6 +836,10 @@ const SETTINGS = [
   ]],
   ['Dips', [
     { k: 'dip_stale_hours', label: 'A dip is out of date after', suffix: 'hours', step: 'any', hint: 'Tanks with older dips are flagged on the Dips screen.' },
+    { k: 'dip_check_l', label: 'Flag a dip that’s off by more than', suffix: 'L', step: 1, hint: 'Each new dip is compared with the dip before it, less the sales since, plus any delivery. Bigger differences are flagged.' },
+  ]],
+  ['Paperwork', [
+    { k: 'paperwork_keep_days', label: 'Keep drivers’ paperwork for', suffix: 'days', step: 1, hint: 'Photos and PDFs are deleted after this. The litres delivered and the dips are kept.' },
   ]],
 ];
 
@@ -1128,9 +1145,23 @@ function levelBar(litres, cap, was) {
 async function tankEstimates() {
   const b = await api('/board').catch(() => null);
   const map = new Map();
-  for (const s of (b && b.sites) || []) for (const g of s.groups) for (const t of g.tanks) if (t.est) map.set(t.id, t.est);
+  for (const s of (b && b.sites) || []) {
+    for (const g of s.groups) {
+      for (const t of g.tanks) if (t.est) map.set(t.id, { ...t.est, expected: t.dip && t.dip.expected, check: g.check || null });
+    }
+  }
   state.tankEst = map;
   return map;
+}
+
+const signedL = (n) => `${n > 0 ? '+' : n < 0 ? '−' : ''}${fmtL(Math.abs(n))}`;
+
+// How a dip compares with what was expected: "Expected 9,850 L · 350 L less".
+function dipCheckHtml(litres, expected, flagged, reported = true) {
+  if (expected == null) return '';
+  const diff = litres - expected;
+  const words = Math.abs(diff) < 1 ? 'as expected' : `${fmtL(Math.abs(diff))} ${diff < 0 ? 'less' : 'more'}`;
+  return `<div class="dip-check${flagged ? '' : ' muted'}">${flagged ? '<span class="badge warn">Check</span> ' : ''}Expected ${fmtL(expected)} · ${words}${reported ? '' : ' <span class="muted">(sales partly estimated)</span>'}</div>`;
 }
 
 function dipState(dip) {
@@ -1169,7 +1200,7 @@ async function viewDips() {
         <div class="main"><div class="title">${esc(t.name)} <span class="chip">${esc(t.grade_code)}</span></div>
           ${d ? (est ? levelBar(est.level, t.capacity_l, d.litres) : levelBar(d.litres, t.capacity_l)) : ''}</div>
         <div class="side dip-side">${!d ? '<span class="badge warn">No dip yet</span>'
-          : est ? `<strong class="num">${fmtL(est.level)}</strong> · ${pct(est.level, t.capacity_l)}% <span class="muted">now</span><div class="dip-was">${dipped}<br>${since}</div>`
+          : est ? `<strong class="num">${fmtL(est.level)}</strong> · ${pct(est.level, t.capacity_l)}% <span class="muted">now</span><div class="dip-was">${dipped}<br>${since}</div>${dipCheckHtml(d.litres, est.expected, est.check && est.check.flagged, !est.check || est.check.reported)}`
           : `<strong class="num">${fmtL(d.litres)}</strong> · ${pct(d.litres, t.capacity_l)}%<div class="dip-was">${dipped}<br>No sales uploaded to estimate from</div>`}${st === 'stale' ? '<span class="badge warn" style="margin-top:4px">Dip out of date</span>' : ''}</div>${icon.chev}</button></li>`;
     }).join('');
     return `<div class="card" data-group="${esc(s.name.toLowerCase())}" data-needs="${needs ? 1 : 0}">
@@ -1243,7 +1274,8 @@ async function dipHistoryDialog(tankId) {
     readOnly: true,
     body: rows.length
       ? `<ul class="dip-hist">${rows.map((d) => `<li><div class="main"><strong class="num">${fmtL(d.litres)}</strong> <span class="muted">(${pct(d.litres, t.capacity_l)}%)</span>
-          <div class="muted" style="font-size:13px">${esc(fmtWhen(d.taken_at))} · ${ago(d.taken_at)}${who(d) ? ' · ' + esc(who(d)) : ''}</div></div>
+          <div class="muted" style="font-size:13px">${esc(fmtWhen(d.taken_at))} · ${ago(d.taken_at)}${who(d) ? ' · ' + esc(who(d)) : ''}</div>
+          ${dipCheckHtml(d.litres, d.expected, d.reported && d.expected != null && Math.abs(d.litres - d.expected) > ((state.settings && state.settings.dip_check_l) || 500), d.reported !== false)}</div>
           ${canDip() ? `<button type="button" class="btn sm ghost danger" data-dip-del="${d.id}">Delete</button>` : ''}</li>`).join('')}</ul>
           ${rows.length === 60 ? '<div class="hint" style="margin-top:8px">Showing the latest 60 dips.</div>' : ''}`
       : emptyHtml('No dips yet', 'Enter one from the Dips screen.'),
@@ -2061,6 +2093,8 @@ function boardGradeDialog(siteId, gradeId) {
         ${row(g.tanks.length > 1 ? 'Latest dips' : 'Latest dip', dips)}
         ${row('Sold since', `${fmtL(g.sold_since_dip)}${g.sold_since_dip_estimated ? `<div class="hint">${fmtL(g.sold_since_dip_estimated)} of it estimated${g.sales_part_at != null ? `, as sales after ${esc(salesTimeLabel(g.sales_part_at, b))} aren’t in yet` : g.sales_to ? `, as sales after ${esc(fmtDayShort(g.sales_to))} aren’t uploaded yet` : ''}</div>` : ''}`)}
         ${g.delivered_since_dip ? row('Delivered since', `${fmtL(g.delivered_since_dip)}<div class="hint">From runs marked done. The next dip replaces this.</div>`) : ''}
+        ${g.check ? row('Latest dip check', `${fmtL(g.check.dipped)} dipped, ${fmtL(g.check.expected)} expected${g.check.flagged ? ' <span class="badge warn">Check</span>' : ''}
+          <div class="hint">${esc(signedL(g.check.diff))} against the dip on ${esc(fmtWhen(g.check.from))}, less the sales since${g.check.after_delivery ? ', plus the delivery' : ''}.${g.check.reported ? '' : ' Some of those sales are estimated, so it isn’t flagged.'}</div>`) : ''}
         ${row('Estimated now', `${fmtL(g.level)} (${pct(g.level, g.capacity)}%)`)}
         ${row('Capacity', fmtL(g.capacity))}
         ${row('Fills to', `${fmtL(g.fill_to)}<div class="hint">${Math.round(st.safe_fill_pct * 100)}% of capacity, less ${fmtL(st.overfill_margin_l)} margin</div>`)}
@@ -2593,21 +2627,28 @@ function deliveryDialog(run) {
   const b = state.board;
   const now = Date.now();
   const gradeCode = new Map((state.cache.grades || []).map((g) => [g.id, g.code]));
+  const progress = run.progress || {};
   const body = p.stops.map((st, i) => {
     const byGrade = new Map();
     for (const c of p.compartments.filter((x) => x.stop === i)) byGrade.set(c.grade_id, (byGrade.get(c.grade_id) || 0) + c.litres);
+    // A drop the driver already recorded starts from what they entered.
+    const prog = progress[st.site_id];
+    const got = (run.delivered || []).filter((d) => d.site_id === st.site_id);
+    const after = (run.after_dips || []).filter((d) => d.site_id === st.site_id);
+    const value = (gid, litres) => (prog ? (got.find((d) => d.grade_id === gid) || { litres: 0 }).litres : litres);
     const site = b && b.sites.find((x) => x.id === st.site_id);
     const tanks = site ? site.groups.flatMap((g) => g.tanks.map((t) => ({ ...t, grade_code: g.grade_code }))) : [];
     return `<div class="deliver" data-stop="${i}"${i ? ' style="margin-top:20px;padding-top:16px;border-top:1px solid var(--border)"' : ''}>
       <h3>${p.stops.length > 1 ? `${i + 1}. ` : ''}${esc(st.site_name)}</h3>
-      <div class="field" style="max-width:200px"><label>Delivered at</label><input type="time" data-at value="${hhmm(Math.min(st.at, now))}"></div>
+      <div class="field" style="max-width:200px"><label>Delivered at</label><input type="time" data-at value="${hhmm(prog ? prog.at : Math.min(st.at, now))}"></div>
+      ${prog ? `<p class="muted" style="font-size:13px;margin:6px 0 0">Recorded by ${esc(prog.by_name || 'the driver')}.</p>` : ''}
       <table class="summary" style="margin-top:8px"><thead><tr><th>Grade</th><th class="n">Loaded</th><th class="n">Delivered</th></tr></thead><tbody>
         ${[...byGrade].map(([gid, litres]) => `<tr><td><span class="chip">${esc(gradeCode.get(gid) || '')}</span></td><td class="n">${fmtL(litres)}</td>
-          <td class="n"><div class="suffix"><input type="number" inputmode="numeric" step="1" min="0" data-grade="${gid}" value="${litres}" aria-label="${esc(gradeCode.get(gid) || '')} delivered in litres"><span class="muted">L</span></div></td></tr>`).join('')}
+          <td class="n"><div class="suffix"><input type="number" inputmode="numeric" step="1" min="0" data-grade="${gid}" value="${value(gid, litres)}" aria-label="${esc(gradeCode.get(gid) || '')} delivered in litres"><span class="muted">L</span></div></td></tr>`).join('')}
       </tbody></table>
       ${tanks.length ? `<p class="muted" style="font-size:13px;margin:12px 0 6px">Dips after the drop, if taken. They replace the estimate.</p>
         <div class="grid">${tanks.map((t) => `<div class="field"><label>${esc(t.name)} <span class="chip">${esc(t.grade_code)}</span></label>
-          <div class="suffix"><input type="number" inputmode="numeric" step="1" min="0" data-tank="${t.id}" placeholder="Litres" aria-label="${esc(t.name)} dip in litres"><span>L</span></div></div>`).join('')}</div>` : ''}
+          <div class="suffix"><input type="number" inputmode="numeric" step="1" min="0" data-tank="${t.id}" placeholder="Litres" value="${(after.find((d) => d.tank_id === t.id) || { litres: '' }).litres}" aria-label="${esc(t.name)} dip in litres"><span>L</span></div></div>`).join('')}</div>` : ''}
     </div>`;
   }).join('');
   openDialog({
@@ -2632,6 +2673,356 @@ function deliveryDialog(run) {
       render();
     },
   });
+}
+
+/* ---------------------------------------------------------- deliveries */
+// Every drop recorded lately, newest first: litres delivered, the dips after it against what
+// they should have read, and the paperwork.
+async function viewDeliveries() {
+  const days = state.delDays || 14;
+  const [data, tanks, grades] = await Promise.all([api(`/deliveries?days=${days}`), load('tanks'), load('grades')]);
+  state.deliveriesData = {
+    ...data, grades,
+    tanks: tanks.filter((t) => t.active).map((t) => ({ id: t.id, name: t.name, site_id: t.site_id, grade_id: t.grade_id, grade_code: t.grade_code, capacity_l: t.capacity_l })),
+  };
+  const code = (id) => (grades.find((g) => g.id === id) || {}).code || '';
+  const drops = [];
+  for (const r of data.runs) {
+    for (const st of r.plan.stops) {
+      const prog = r.progress[st.site_id];
+      const got = r.delivered.filter((d) => d.site_id === st.site_id);
+      const papers = r.paperwork.filter((p) => p.site_id === st.site_id);
+      if (!prog && !got.length && !papers.length) continue;
+      const at = prog ? prog.at : got.length ? Math.max(...got.map((d) => d.delivered_at)) : papers[0].uploaded_at;
+      drops.push({ r, st, prog, got, papers, at, dips: r.after_dips.filter((d) => d.site_id === st.site_id), checks: r.checks.filter((c) => c.site_id === st.site_id) });
+    }
+  }
+  drops.sort((a, b) => b.at - a.at);
+  const flagged = drops.filter((d) => d.checks.some((c) => c.flagged)).length;
+  const select = `<select id="del-days" aria-label="How far back">${[7, 14, 30].map((n) => `<option value="${n}"${n === days ? ' selected' : ''}>Last ${n} days</option>`).join('')}</select>`;
+  const card = (d) => {
+    const check = (gid) => d.checks.find((c) => c.grade_id === gid);
+    const rows = d.dips.map((x) => {
+      const c = check(x.grade_id);
+      const diff = x.expected != null ? x.litres - x.expected : null;
+      return `<tr><td>${esc(x.tank_name || 'Tank')} <span class="chip">${esc(x.grade_code || '')}</span></td><td class="n">${fmtL(x.litres)}</td>
+        <td class="n">${x.expected != null ? fmtL(x.expected) : '<span class="muted">—</span>'}</td>
+        <td class="n${c && c.flagged ? ' flag' : ''}">${diff != null ? esc(signedL(diff)) : ''}${c && c.flagged ? ' <span class="badge warn">Check</span>' : ''}${c && !c.reported ? '<div class="muted" style="font-weight:400;font-size:12px">sales partly estimated</div>' : ''}</td></tr>`;
+    }).join('');
+    return `<div class="card drop-card">
+      <div class="run-head"><strong>${esc(d.st.site_name)}</strong><span class="muted">${esc(fmtWhen(d.at))}</span>
+        ${d.checks.some((c) => c.flagged) ? '<span class="badge warn">Dip check</span>' : ''}${d.prog ? '' : '<span class="badge">Paperwork only</span>'}
+        <span class="spacer"></span><span class="muted">${esc(d.r.plan.truck_name || 'Truck')}${d.prog && d.prog.by_name ? ` · ${esc(d.prog.by_name)}` : ''}</span></div>
+      <div class="drop-body">
+        <div class="delivered">${d.got.length ? d.got.map((x) => `<span><span class="chip">${esc(code(x.grade_id))}</span> <strong class="num">${fmtL(x.litres)}</strong></span>`).join('') : '<span class="muted">No litres recorded</span>'}</div>
+        ${rows ? `<table class="summary"><thead><tr><th>Dip after the drop</th><th class="n">Dipped</th><th class="n">Expected</th><th class="n">Difference</th></tr></thead><tbody>${rows}</tbody></table>`
+          : '<div class="muted" style="font-size:13px">No dips after the drop.</div>'}
+        <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">
+          ${d.papers.map((x, k) => `<button class="btn sm" data-paper="${d.r.id}:${d.st.site_id}:${k}">${paperLabel(x, k)}</button>`).join('')}
+          ${canDip() ? `<label class="btn sm">Add paperwork<input type="file" hidden accept="image/*,application/pdf" multiple data-paper-add="${d.r.id}:${d.st.site_id}"></label>
+          <button class="btn sm ghost" data-act="del-drop" data-run="${d.r.id}" data-site="${d.st.site_id}">Change</button>` : ''}
+        </div>
+      </div></div>`;
+  };
+  return headHtml('Deliveries', `Drops recorded in the last ${days} days. Each dip after a drop is compared with the dip before it, less the sales since, plus the delivery; differences over ${fmtL(data.threshold)} are flagged. Paperwork is kept for ${plural(data.keep_days, 'day')}.`, select) +
+    (drops.length ? `<div class="stats"><span><strong>${fmtN(drops.length)}</strong> ${drops.length === 1 ? 'drop' : 'drops'}</span><span><strong>${fmtN(flagged)}</strong> to check</span></div>
+      <div style="display:grid;gap:16px">${drops.map(card).join('')}</div>`
+      : `<div class="card">${emptyHtml('No drops recorded yet', 'Drops show here once a driver completes them on their phone, or a run is marked done on the Plan screen.')}</div>`);
+}
+
+/* ---------------------------------------------------------- paperwork */
+// Photos and PDFs of the delivery paperwork, added when a drop is done. Photos are shrunk to
+// about 2000 px on the long side first: sharp enough to read, small enough to send from a
+// phone on a slow connection.
+async function shrinkPhoto(file) {
+  if (!/^image\/(jpeg|png|webp|heic|heif)$/i.test(file.type)) return file;
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const i = new Image();
+      i.onload = () => resolve(i);
+      i.onerror = reject;
+      i.src = url;
+    });
+    const scale = Math.min(1, 2000 / Math.max(img.naturalWidth, img.naturalHeight));
+    const c = document.createElement('canvas');
+    c.width = Math.round(img.naturalWidth * scale);
+    c.height = Math.round(img.naturalHeight * scale);
+    c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+    const blob = await new Promise((resolve) => c.toBlob(resolve, 'image/jpeg', 0.82));
+    return blob && blob.size < file.size ? new File([blob], `${file.name.replace(/\.[^.]+$/, '') || 'photo'}.jpg`, { type: 'image/jpeg' }) : file;
+  } catch {
+    return file;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function uploadPaperworkFile(file, runId, siteId) {
+  const f = await shrinkPhoto(file);
+  const type = f.type || (/\.pdf$/i.test(f.name) ? 'application/pdf' : 'image/jpeg');
+  const res = await fetch(`/api/paperwork?run_id=${runId || ''}&site_id=${siteId || ''}&name=${encodeURIComponent(f.name || 'paperwork')}`, {
+    method: 'POST', headers: { 'content-type': type }, body: f,
+  });
+  const out = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`${file.name || 'A file'}: ${out.error || 'it couldn’t be uploaded.'}`);
+  return out.id;
+}
+
+const paperworkUrls = new Map();
+async function paperworkUrl(id) {
+  if (paperworkUrls.has(id)) return paperworkUrls.get(id);
+  const res = await fetch(`/api/paperwork/${id}`);
+  if (!res.ok) throw new Error((await res.json().catch(() => ({}))).error || 'That paperwork couldn’t be opened.');
+  let blob;
+  if ((res.headers.get('content-type') || '').includes('json')) {
+    const j = await res.json();
+    blob = new Blob([b64ToBuffer(j.data)], { type: j.content_type || '' });
+  } else {
+    blob = await res.blob();
+  }
+  const out = { url: URL.createObjectURL(blob), type: blob.type };
+  paperworkUrls.set(id, out);
+  return out;
+}
+
+// The runs on screen (plan, deliveries or the driver's day), to find a run's paperwork.
+const runsOnScreen = () => [...(state.planRuns || []), ...((state.deliveriesData && state.deliveriesData.runs) || []), ...((state.driver && state.driver.runs) || [])];
+
+const paperLabel = (p, k) => `${/pdf/i.test(p.content_type || '') ? 'PDF' : 'Photo'} ${k + 1}`;
+
+function paperworkDialog(list, start, onChange) {
+  let i = start;
+  openDialog({
+    title: 'Paperwork',
+    readOnly: true,
+    body: `<div class="muted" id="pw-meta" style="font-size:13px;margin-bottom:10px"></div><div id="pw-view" class="pw-view"></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+        <button type="button" class="btn sm" id="pw-prev">‹ Previous</button><button type="button" class="btn sm" id="pw-next">Next ›</button>
+        <a class="btn sm" id="pw-open" target="_blank" rel="noopener">Open full size</a>
+        <span class="spacer"></span><button type="button" class="btn sm ghost danger" id="pw-del">Delete</button></div>`,
+  });
+  const show = async () => {
+    const p = list[i];
+    $('#pw-meta').textContent = `${i + 1} of ${list.length} · ${p.filename} · ${fmtWhen(p.uploaded_at)}${p.uploaded_by_name ? ` · ${p.uploaded_by_name}` : ''}`;
+    $('#pw-prev').disabled = i === 0;
+    $('#pw-next').disabled = i === list.length - 1;
+    const del = $('#pw-del');
+    del.dataset.confirm = '';
+    del.textContent = 'Delete';
+    del.hidden = !(canDip() || p.uploaded_by_name === state.me.name);
+    $('#pw-view').innerHTML = '<div class="note">Opening…</div>';
+    try {
+      const { url, type } = await paperworkUrl(p.id);
+      if (list[i] !== p) return;
+      $('#pw-open').href = url;
+      $('#pw-view').innerHTML = /pdf/i.test(type)
+        ? `<div class="note">A PDF. Use <strong>Open full size</strong> to read it.</div>`
+        : `<img src="${url}" alt="${esc(p.filename)}">`;
+    } catch (err) {
+      $('#pw-view').innerHTML = `<div class="note bad">${esc(err.message)}</div>`;
+    }
+  };
+  $('#pw-prev').onclick = () => { if (i > 0) { i--; show(); } };
+  $('#pw-next').onclick = () => { if (i < list.length - 1) { i++; show(); } };
+  $('#pw-del').onclick = async (e) => {
+    const btn = e.currentTarget;
+    if (btn.dataset.confirm !== '1') { btn.dataset.confirm = '1'; btn.textContent = 'Tap again to delete'; return; }
+    try {
+      await api(`/paperwork/${list[i].id}`, { method: 'DELETE' });
+      toast('Paperwork deleted');
+      $('#dlg').close();
+      if (onChange) onChange();
+    } catch (err) {
+      toast(err.message);
+    }
+  };
+  show();
+}
+
+function openRunPaperwork(key) {
+  const [runId, siteId, k] = key.split(':').map(Number);
+  const run = runsOnScreen().find((r) => r.id === runId);
+  if (!run) return;
+  const list = (run.paperwork || []).filter((p) => !siteId || p.site_id === siteId);
+  if (list.length) paperworkDialog(list, Math.min(k || 0, list.length - 1), refreshScreen);
+}
+
+async function addPaperwork(input) {
+  const [runId, siteId] = input.dataset.paperAdd.split(':').map(Number);
+  const files = [...input.files];
+  input.value = '';
+  if (!files.length) return;
+  try {
+    for (let k = 0; k < files.length; k++) {
+      toast(`Uploading ${k + 1} of ${files.length}…`);
+      await uploadPaperworkFile(files[k], runId, siteId);
+    }
+    toast(files.length === 1 ? 'Paperwork added' : `${files.length} files added`);
+  } catch (err) {
+    toast(err.message);
+  }
+  refreshScreen();
+}
+
+const refreshScreen = () => (state.me && state.me.role === 'driver' ? renderDriver() : render());
+
+/* ------------------------------------------------------------- drivers */
+// What a driver sees: the day's runs with each truck's load, and a form to complete each
+// drop with the litres, the dips after it and photos of the paperwork.
+function driverShell() {
+  return `<header class="top"><div class="bar">
+      <a class="brand" href="#/">${icon.logo}<span>Fuel Scheduler<small>${esc(state.me.company_name)}</small></span></a>
+      <span class="spacer"></span>
+      <div class="menu" id="menu">
+        <button class="btn sm" id="menu-btn" aria-haspopup="true" aria-expanded="false">${esc(state.me.name.split(' ')[0])}</button>
+        <div class="menu-list" role="menu">
+          <div class="who">${esc(state.me.email)}<br>Driver</div>
+          <button data-act="password" role="menuitem">Change password</button>
+          <button data-act="logout" role="menuitem">Sign out</button>
+        </div>
+      </div></div></header>
+    <main id="main"></main>`;
+}
+
+async function renderDriver() {
+  const app = $('#app');
+  if (!$('#main') || $('nav.tabs')) app.innerHTML = driverShell();
+  const main = $('#main');
+  const ticket = ++renderTicket;
+  try {
+    const data = await api('/driver/runs' + (state.driverDate ? `?date=${state.driverDate}` : ''));
+    if (ticket !== renderTicket) return;
+    state.driver = data;
+    state.settings = { ...(state.settings || {}), timezone: data.timezone };
+    main.innerHTML = driverHtml(data);
+  } catch (err) {
+    if (ticket === renderTicket) main.innerHTML = `<div class="note bad">${esc(err.message)}</div>`;
+  }
+}
+
+function driverHtml(d) {
+  const day = d.date;
+  const btn = (to, label) => `<button class="btn" data-act="drv-day" data-day="${to}">${label}</button>`;
+  const actions = btn(addDays(day, -1), '‹ Earlier') + (day !== d.today ? btn(d.today, 'Today') : '') + btn(addDays(day, 1), 'Later ›');
+  const title = day === d.today ? 'Today’s runs' : `Runs for ${fmtDayShort(day)}`;
+  return headHtml(title, `${esc(fmtDayShort(day))}. After each drop, tap <strong>Complete drop</strong>: check the litres, enter the dips after the drop and add photos of the paperwork.`, actions) +
+    (d.runs.length ? `<div style="display:grid;gap:16px">${d.runs.map((r) => driverRunHtml(r, d)).join('')}</div>`
+      : `<div class="card">${emptyHtml('No runs', 'There are no runs planned for this day yet.')}</div>`) +
+    `<p class="muted" style="font-size:13px;margin-top:16px">Paperwork is kept for ${plural(d.keep_days, 'day')}.</p>`;
+}
+
+function driverRunHtml(r, d) {
+  const p = r.plan;
+  const code = (id) => (d.grades.find((g) => g.id === id) || {}).code || '';
+  const total = p.compartments.reduce((a, c) => a + c.litres, 0);
+  const doneCount = p.stops.filter((st) => r.progress[st.site_id]).length;
+  const badge = r.status === 'done' ? '<span class="badge ok">Done</span>'
+    : doneCount ? `<span class="badge warn">${doneCount} of ${p.stops.length} drops done</span>` : '<span class="badge">To do</span>';
+  const stops = p.stops.map((st, i) => {
+    const byGrade = new Map();
+    for (const c of p.compartments.filter((x) => x.stop === i)) {
+      if (!byGrade.has(c.grade_id)) byGrade.set(c.grade_id, { litres: 0, comps: [] });
+      const g = byGrade.get(c.grade_id);
+      g.litres += c.litres;
+      g.comps.push(`C${c.position}`);
+    }
+    const tanks = d.tanks.filter((t) => t.site_id === st.site_id);
+    const prog = r.progress[st.site_id];
+    const delivered = r.delivered.filter((x) => x.site_id === st.site_id);
+    const dips = r.after_dips.filter((x) => x.site_id === st.site_id);
+    const papers = r.paperwork.filter((x) => x.site_id === st.site_id);
+    const tankName = (id) => (tanks.find((t) => t.id === id) || {}).name || 'Tank';
+    return `<div class="drv-drop">
+      <div class="run-stop"><span class="run-num">${i + 1}</span><strong>${esc(st.site_name)}</strong><span class="muted">about ${esc(fmtTime(st.at))}</span></div>
+      <table class="summary drop-load"><thead><tr><th>Grade</th><th class="n">Litres</th><th>From</th><th>Into</th></tr></thead><tbody>
+        ${[...byGrade].map(([gid, g]) => `<tr><td><span class="chip">${esc(code(gid))}</span></td><td class="n">${fmtL(g.litres)}</td><td>${esc(g.comps.join(', '))}</td>
+          <td>${esc(tanks.filter((t) => t.grade_id === gid).map((t) => t.name).join(', ') || '—')}</td></tr>`).join('')}
+      </tbody></table>
+      ${prog ? `<div class="drop-done"><strong>Delivered ${esc(fmtTime(prog.at))}</strong>${prog.by_name ? ` · ${esc(prog.by_name)}` : ''}<br>
+        ${delivered.length ? delivered.map((x) => `${esc(code(x.grade_id))} ${fmtL(x.litres)}`).join(' · ') : 'Nothing delivered'}<br>
+        ${dips.length ? `Dips after: ${dips.map((x) => `${esc(tankName(x.tank_id))} ${fmtL(x.litres)}`).join(' · ')}` : '<span class="muted">No dips after the drop entered</span>'}</div>` : ''}
+      ${papers.length ? `<div class="paper-list">${papers.map((x, k) => `<button class="btn sm" data-paper="${r.id}:${st.site_id}:${k}">${paperLabel(x, k)}</button>`).join('')}</div>` : ''}
+      <div class="drop-actions">${prog
+        ? `<button class="btn" data-act="drv-drop" data-run="${r.id}" data-site="${st.site_id}">Change</button>
+           <label class="btn">Add paperwork<input type="file" hidden accept="image/*,application/pdf" multiple data-paper-add="${r.id}:${st.site_id}"></label>`
+        : `<button class="btn primary" data-act="drv-drop" data-run="${r.id}" data-site="${st.site_id}">Complete drop</button>`}</div>
+    </div>`;
+  }).join('');
+  return `<div class="card run" data-drun="${r.id}">
+    <div class="run-head"><strong>${esc(p.truck_name || 'Truck')}</strong>${p.truck_rego ? `<span class="muted">${esc(p.truck_rego)}</span>` : ''}${badge}
+      <span class="spacer"></span><span class="muted num">${fmtL(total)}</span></div>
+    ${r.driver_name ? `<div class="muted" style="padding:8px 16px 0;font-size:13px">Driver: ${esc(r.driver_name)}</div>` : ''}
+    ${stops}
+  </div>`;
+}
+
+// Completing one drop: when, the litres that went in (the load sheet's unless changed), the
+// dips after it, and the paperwork. Saving again replaces what was entered before.
+function dropDialog(run, siteId, tanksAll, gradesAll) {
+  const p = run.plan;
+  const i = p.stops.findIndex((st) => st.site_id === siteId);
+  const st = p.stops[i];
+  const prog = run.progress[siteId];
+  const planned = new Map();
+  for (const c of p.compartments.filter((x) => x.stop === i)) planned.set(c.grade_id, (planned.get(c.grade_id) || 0) + c.litres);
+  const delivered = run.delivered.filter((x) => x.site_id === siteId);
+  const dips = run.after_dips.filter((x) => x.site_id === siteId);
+  const papers = run.paperwork.filter((x) => x.site_id === siteId);
+  const tanks = tanksAll.filter((t) => t.site_id === siteId);
+  const code = (id) => (gradesAll.find((g) => g.id === id) || {}).code || '';
+  const gradeIds = [...new Set([...planned.keys(), ...delivered.map((x) => x.grade_id)])];
+  const litresFor = (gid) => (prog ? (delivered.find((x) => x.grade_id === gid) || { litres: 0 }).litres : planned.get(gid) || 0);
+  const at = prog ? prog.at : Math.min(Date.now(), run.run_date === localIsoOf(Date.now()) ? Date.now() : st.at);
+  openDialog({
+    title: st.site_name,
+    sub: `${p.truck_name || 'Truck'} · drop ${i + 1} of ${p.stops.length}`,
+    anyone: true,
+    saveLabel: 'Save drop',
+    body: `<div class="field" style="max-width:200px"><label for="drop_at">Delivered at</label><input type="time" id="drop_at" value="${hhmm(at)}"></div>
+      <h3 class="drop-h">Litres delivered</h3>
+      <div class="grid">${gradeIds.map((gid) => `<div class="field"><label for="dg_${gid}"><span class="chip">${esc(code(gid))}</span>
+          <span class="muted" style="font-weight:400">loaded ${fmtL(planned.get(gid) || 0)}</span></label>
+        <div class="suffix"><input type="number" inputmode="numeric" step="1" min="0" id="dg_${gid}" data-grade="${gid}" value="${litresFor(gid)}"><span>L</span></div></div>`).join('')}</div>
+      <h3 class="drop-h">Dips after the drop</h3>
+      <p class="muted" style="font-size:13px;margin:0 0 8px">Litres in each tank once the fuel is in.</p>
+      <div class="grid">${tanks.map((t) => {
+        const was = dips.find((x) => x.tank_id === t.id);
+        return `<div class="field"><label for="dt_${t.id}">${esc(t.name)} <span class="chip">${esc(t.grade_code)}</span></label>
+          <div class="suffix"><input type="number" inputmode="numeric" step="1" min="0" id="dt_${t.id}" data-tank="${t.id}" placeholder="Litres" value="${was ? was.litres : ''}"><span>L</span></div>
+          <div class="hint">Capacity ${fmtL(t.capacity_l)}</div></div>`;
+      }).join('') || '<p class="muted">This site has no active tanks.</p>'}</div>
+      <h3 class="drop-h">Paperwork</h3>
+      <label class="btn">Take or choose photos<input type="file" id="drop_files" accept="image/*,application/pdf" multiple hidden></label>
+      <div id="drop_files_list" class="muted" style="font-size:13px;margin-top:6px">${papers.length ? `${plural(papers.length, 'file')} already added. ` : ''}Photos of the delivery docket and dip sheet, or PDFs.</div>
+      <div id="drop_progress" class="muted" style="font-size:13px;margin-top:6px"></div>`,
+    onSave: async (form) => {
+      const time = $('#drop_at', form).value;
+      if (!time) throw new Error('Enter the time of the drop.');
+      const body = {
+        at: atFromTime(run.run_date, time),
+        grades: $$('[data-grade]', form).map((el) => ({ grade_id: Number(el.dataset.grade), litres: el.value === '' ? 0 : Number(el.value) })),
+        dips: $$('[data-tank]', form).filter((el) => el.value !== '').map((el) => ({ tank_id: Number(el.dataset.tank), litres: el.value })),
+      };
+      const res = await api(`/runs/${run.id}/drops/${siteId}/complete`, { method: 'POST', body });
+      const files = [...$('#drop_files', form).files];
+      for (let k = 0; k < files.length; k++) {
+        if (uploaded.has(k)) continue;
+        $('#drop_progress').textContent = `Uploading paperwork ${k + 1} of ${files.length}…`;
+        await uploadPaperworkFile(files[k], run.id, siteId);
+        uploaded.add(k);
+      }
+      toast(res.warnings && res.warnings.length ? res.warnings[0] : res.done ? 'Drop saved. That’s the run done.' : 'Drop saved');
+      refreshScreen();
+    },
+  });
+  // Files already sent aren't sent again if saving is tried a second time.
+  const uploaded = new Set();
+  $('#drop_files').onchange = (e) => {
+    uploaded.clear();
+    const n = e.target.files.length;
+    $('#drop_files_list').textContent = n ? `${plural(n, 'file')} chosen: ${[...e.target.files].map((f) => f.name).join(', ')}` : '';
+  };
 }
 
 /* ------------------------------------------------------ load optimiser */
@@ -3258,17 +3649,24 @@ async function copyText(text) {
 function runCardHtml(r) {
   const p = r.plan;
   const total = p.compartments.reduce((a, c) => a + c.litres, 0);
+  const progress = r.progress || {};
+  const doneCount = p.stops.filter((st) => progress[st.site_id]).length;
   return `<div class="card run" data-run="${r.id}">
     <div class="run-head"><strong>${esc(p.truck_name || 'Truck')}</strong>
-      <span class="badge ${r.status === 'done' ? 'off' : 'ok'}">${r.status === 'done' ? 'Done' : 'Confirmed'}</span>
+      <span class="badge ${r.status === 'done' ? 'off' : doneCount ? 'warn' : 'ok'}">${r.status === 'done' ? 'Done' : doneCount ? `${doneCount} of ${p.stops.length} drops done` : 'Confirmed'}</span>
       <span class="muted num">${fmtL(total)}</span><span class="spacer"></span>
       <button class="btn sm ghost danger" data-act="run-delete">Delete</button></div>
     ${p.stops.map((st, i) => `<div class="run-stop"><span class="run-num">${i + 1}</span><strong>${esc(st.site_name)}</strong><span class="muted">about ${esc(fmtTime(st.at))}</span></div>
       <div class="run-comps" style="padding-top:0">${p.compartments.filter((c) => c.stop === i).map((c) => `<span class="comp"><b>C${c.position}</b>${esc(c.grade_code)} ${fmtN(c.litres)}${c.litres < c.capacity ? ' (part)' : ''}</span>`).join('')}</div>`).join('')}
     ${(() => { const w = runWeights(r); return w.length ? `<div class="run-weight">${w.map((x) => `<span>${esc(x.label)} <strong class="num">${tonnes2(x.gross)}</strong> of ${tonnes2(x.limit)} ${x.kind}</span>`).join('')}</div>` : ''; })()}
-    ${r.status === 'done' && r.delivered && r.delivered.length ? `<div class="run-weight">${p.stops.map((st) => {
-      const mine = r.delivered.filter((d) => d.site_id === st.site_id);
-      return mine.length ? `<span>Delivered to ${esc(st.site_name)} <strong class="num">${fmtL(mine.reduce((a, d) => a + d.litres, 0))}</strong> at ${esc(fmtTime(Math.max(...mine.map((d) => d.delivered_at))))}</span>` : '';
+    ${doneCount || (r.delivered && r.delivered.length) || (r.paperwork && r.paperwork.length) ? `<div class="run-weight">${p.stops.map((st) => {
+      const mine = (r.delivered || []).filter((d) => d.site_id === st.site_id);
+      const prog = progress[st.site_id];
+      const papers = (r.paperwork || []).filter((x) => x.site_id === st.site_id);
+      const paper = papers.length ? ` · <button type="button" class="linkish" data-paper="${r.id}:${st.site_id}:0">${plural(papers.length, 'paperwork file')}</button>` : '';
+      if (!prog && !mine.length) return paper ? `<span>${esc(st.site_name)}${paper}</span>` : '';
+      const at = prog ? prog.at : Math.max(...mine.map((d) => d.delivered_at));
+      return `<span>Delivered to ${esc(st.site_name)} <strong class="num">${fmtL(mine.reduce((a, d) => a + d.litres, 0))}</strong> at ${esc(fmtTime(at))}${prog && prog.by_name ? ` by ${esc(prog.by_name)}` : ''}${paper}</span>`;
     }).join('')}</div>` : ''}
     <div class="run-foot"><button class="btn" data-act="run-sheet">Copy load sheet</button>
       ${r.status === 'done' ? '<button class="btn ghost" data-act="run-undone">Mark not done</button>' : '<button class="btn ghost" data-act="run-done">Mark done</button>'}</div>
@@ -3459,15 +3857,10 @@ async function render() {
     wireAuth(state.needsSetup);
     return;
   }
-  if (state.me.role === 'driver') {
-    app.innerHTML = `<div class="auth"><div class="card">${icon.logo}<h1>Hi ${esc(state.me.name)}</h1>
-      <p class="muted">Driver screens are coming in the next part of the build. Your runs will show here.</p>
-      <button class="btn" data-act="logout">Sign out</button></div></div>`;
-    return;
-  }
+  if (state.me.role === 'driver') return renderDriver();
   const parts = (location.hash.replace(/^#\/?/, '') || 'board').split('/');
   const route = parts[0];
-  const views = { board: viewBoard, plan: viewPlan, sales: viewSales, sites: viewSites, dips: viewDips, tanks: viewTanks, trucks: viewTrucks, grades: viewGrades, terminals: viewTerminals, drivers: viewDrivers, settings: viewSettings, import: viewImport, users: viewUsers };
+  const views = { board: viewBoard, plan: viewPlan, deliveries: viewDeliveries, sales: viewSales, sites: viewSites, dips: viewDips, tanks: viewTanks, trucks: viewTrucks, grades: viewGrades, terminals: viewTerminals, drivers: viewDrivers, settings: viewSettings, import: viewImport, users: viewUsers };
   const view = route === 'sites' && parts[1] ? () => viewSite(Number(parts[1])) : views[route] || viewBoard;
   if (!$('#main')) app.innerHTML = shell(route, '');
   else $$('nav.tabs a').forEach((a) => a.classList.toggle('on', a.getAttribute('href') === '#/' + route));
@@ -3512,6 +3905,9 @@ function afterRender(route) {
     };
     ['#f-site', '#f-grade', '#f-active'].forEach((s) => { $(s).onchange = apply; });
     apply();
+  }
+  if (route === 'deliveries' && $('#del-days')) {
+    $('#del-days').onchange = (e) => { state.delDays = Number(e.target.value); render(); };
   }
   if (route === 'settings') {
     const form = $('#settings-form');
@@ -3586,7 +3982,7 @@ function afterRender(route) {
 }
 
 document.addEventListener('click', async (e) => {
-  const t = e.target.closest('[data-add],[data-edit],[data-edit-tank],[data-edit-site],[data-user],[data-add-user],[data-act],[data-dip-enter],[data-dip-upload],[data-dip-tank],[data-board-grade],#menu-btn');
+  const t = e.target.closest('[data-add],[data-edit],[data-edit-tank],[data-edit-site],[data-user],[data-add-user],[data-act],[data-dip-enter],[data-dip-upload],[data-dip-tank],[data-board-grade],[data-paper],#menu-btn');
   const menu = $('#menu');
   if (menu && !e.target.closest('#menu')) { menu.classList.remove('open'); $('#menu-btn').setAttribute('aria-expanded', 'false'); }
   if (!t) return;
@@ -3603,6 +3999,17 @@ document.addEventListener('click', async (e) => {
       render();
     } else if (t.dataset.act === 'board-refresh') {
       render();
+    } else if (t.dataset.paper) {
+      openRunPaperwork(t.dataset.paper);
+    } else if (t.dataset.act === 'drv-day') {
+      state.driverDate = t.dataset.day;
+      renderDriver();
+    } else if (t.dataset.act === 'drv-drop') {
+      const d = state.driver;
+      dropDialog(d.runs.find((r) => r.id === Number(t.dataset.run)), Number(t.dataset.site), d.tanks, d.grades);
+    } else if (t.dataset.act === 'del-drop') {
+      const d = state.deliveriesData;
+      dropDialog(d.runs.find((r) => r.id === Number(t.dataset.run)), Number(t.dataset.site), d.tanks, d.grades);
     } else if (t.dataset.act === 'sales-items') {
       itemLinksDialog(state.salesData.items, await load('grades', true), () => render());
     } else if (t.dataset.boardGrade) {
@@ -3636,6 +4043,11 @@ document.addEventListener('click', async (e) => {
   } catch (err) {
     toast(err.message);
   }
+});
+
+// Paperwork chosen from an "Add paperwork" button.
+document.addEventListener('change', (e) => {
+  if (e.target.matches && e.target.matches('input[type=file][data-paper-add]')) addPaperwork(e.target);
 });
 
 window.addEventListener('hashchange', render);
