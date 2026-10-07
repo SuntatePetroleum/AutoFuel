@@ -1709,19 +1709,14 @@ async function readIdealposTrend(buffer) {
   const end = isoDay(+range[6], MONTHS[range[5].toLowerCase()], +range[4]);
 
   const DATE = /^(\d{2})\/(\d{2})\/(\d{4})$/;
-  const NUM = /^-?[\d,]*\.?\d+$/;
-  const rowsOf = (pieces) => {
-    const rows = [];
-    for (const p of pieces.filter((x) => NUM.test(x.s)).sort((a, b) => a.y - b.y || a.x - b.x)) {
-      const row = rows.find((r) => Math.abs(r.y - p.y) <= 2);
-      if (row) row.cells.push(p);
-      else rows.push({ y: p.y, cells: [p] });
-    }
-    for (const r of rows) r.cells.sort((a, b) => a.x - b.x);
-    return rows;
+  // Figures, including negatives written as -1.50, 1.50- or (1.50).
+  const NUM = /^\(?-?[\d,]*\.?\d+-?\)?$/;
+  const valueOf = (s) => {
+    const n = Number(s.replace(/[(),\-\s]/g, ''));
+    return /^\(.*\)$|^-|-$/.test(s) ? -n : n;
   };
 
-  // Item labels ("99902 E10") and the Total row are on the first page.
+  // Item labels ("99902 E10") and the Total row's label are on the first page.
   const first = pages[0];
   const items = first
     .filter((p) => /^\d{3,} \S/.test(p.s) && !DATE.test(p.s) && p.x < 200)
@@ -1731,6 +1726,17 @@ async function readIdealposTrend(buffer) {
       return { code, name, y: p.y, days: {} };
     });
   if (!items.length) throw new Error('Couldn’t find any stock items in this report.');
+  const totalLabel = first.find((p) => p.s === 'Total' && p.x < 200 && p.y > items[items.length - 1].y);
+  if (!totalLabel) throw new Error('Couldn’t find the report’s Total row.');
+  // Rows: each item, then the Total row. Figures sit on the same line as their label.
+  const rowYs = [...items.map((it) => it.y), totalLabel.y];
+  const rowName = (i) => (i < items.length ? `${items[i].code} ${items[i].name}` : 'the Total row');
+  const rowOf = (p) => {
+    let best = -1;
+    let gap = 4;
+    rowYs.forEach((y, i) => { if (Math.abs(p.y - y) < gap) { gap = Math.abs(p.y - y); best = i; } });
+    return best;
+  };
 
   const dayTotals = {};
   let itemTotals = null;
@@ -1739,28 +1745,43 @@ async function readIdealposTrend(buffer) {
     const heads = pg.filter((p) => (DATE.test(p.s) || p.s === 'Total') && p.y < items[0].y - 2);
     const dateHeads = heads.filter((p) => DATE.test(p.s)).sort((a, b) => a.x - b.x);
     if (!dateHeads.length) continue;
-    const hasTotalCol = heads.some((p) => p.s === 'Total' && p.x > dateHeads[dateHeads.length - 1].x);
-    const rows = rowsOf(pg.filter((p) => p.y > dateHeads[0].y + 2));
-    if (rows.length !== items.length + 1) throw new Error('The report’s layout wasn’t what the app expected, so nothing was read from it.');
-    const cols = dateHeads.length + (hasTotalCol ? 1 : 0);
-    rows.forEach((r, i) => {
-      if (r.cells.length !== cols) throw new Error('A row in the report has missing figures, so nothing was read from it.');
-      const values = r.cells.map((c) => Number(c.s.replace(/,/g, '')));
-      dateHeads.forEach((h, j) => {
-        const [, d, mo, y] = h.s.match(DATE);
-        const iso = isoDay(+y, +mo, +d);
-        if (i === 0) {
-          if (iso <= lastDay || iso < start || iso > end) throw new Error('The report’s dates aren’t in order, so nothing was read from it.');
-          lastDay = iso;
-        }
-        if (i < items.length) items[i].days[iso] = values[j];
-        else dayTotals[iso] = values[j];
-      });
-      if (hasTotalCol) {
-        itemTotals = itemTotals || [];
-        itemTotals[i] = values[cols - 1];
-      }
+    const totalHead = heads.find((p) => p.s === 'Total' && p.x > dateHeads[dateHeads.length - 1].x);
+    // Columns, by their right-hand edge: figures are right-aligned under their heading.
+    const cols = dateHeads.map((h) => {
+      const [, d, mo, y] = h.s.match(DATE);
+      const iso = isoDay(+y, +mo, +d);
+      if (iso <= lastDay || iso < start || iso > end) throw new Error('The report’s dates aren’t in order, so nothing was read from it.');
+      lastDay = iso;
+      return { day: iso, label: h.s, right: h.x + h.w };
     });
+    if (totalHead) cols.push({ day: null, label: 'Total', right: totalHead.x + totalHead.w });
+    const spacing = cols.length > 1 ? Math.min(...cols.slice(1).map((c, k) => c.right - cols[k].right)) : 46;
+    // Each figure goes in the cell under its column and on its row's line. A cell left
+    // blank counts as nothing sold; the totals checks below catch anything that isn't.
+    const grid = rowYs.map(() => cols.map(() => []));
+    for (const p of pg) {
+      if (p.y <= dateHeads[0].y + 2 || !NUM.test(p.s)) continue;
+      let col = -1;
+      let near = spacing / 2;
+      cols.forEach((c, j) => { const d = Math.abs(p.x + p.w - c.right); if (d < near) { near = d; col = j; } });
+      if (col < 0) continue;
+      const row = rowOf(p);
+      if (row < 0) throw new Error(`There’s a figure (${p.s}) under ${cols[col].label} that isn’t on any item’s line, so nothing was read from this report.`);
+      grid[row][col].push(p);
+    }
+    grid.forEach((cells, i) => cells.forEach((list, j) => {
+      const text = list.sort((a, b) => a.x - b.x).map((p) => p.s).join('');
+      const value = list.length ? valueOf(text) : 0;
+      if (!Number.isFinite(value)) throw new Error(`Couldn’t read “${text}” for ${rowName(i)} under ${cols[j].label}, so nothing was read from this report.`);
+      const c = cols[j];
+      if (c.day) {
+        if (i < items.length) items[i].days[c.day] = value;
+        else dayTotals[c.day] = value;
+      } else {
+        itemTotals = itemTotals || [];
+        itemTotals[i] = value;
+      }
+    }));
   }
 
   // Check against the report's own totals. Days the report leaves out (no figures
@@ -2441,7 +2462,7 @@ function feedCardHtml(feed) {
   const rows = files.map((f) => {
     const [cls, label] = FEED_STATUS[f.status] || ['', f.status];
     return `<tr><td><strong>${esc(f.filename)}</strong><span class="sub">${esc(fmtWhen(f.received_at))} · ${esc(f.via === 'upload' ? 'sent by a script' : f.sender || 'email')}</span>${f.note ? `<span class="sub">${esc(f.note)}</span>` : ''}</td>
-      <td class="n"><span class="badge ${cls}">${esc(label)}</span>${f.status === 'attention' ? `<br><button class="btn sm" style="margin-top:6px" data-feed-open="${f.id}">Link and load</button>` : ''}</td></tr>`;
+      <td class="n"><span class="badge ${cls}">${esc(label)}</span>${f.status === 'attention' ? `<br><button class="btn sm" style="margin-top:6px" data-feed-open="${f.id}">Link and load</button>` : ''}${f.status === 'failed' && f.kept ? `<br><span style="display:inline-flex;gap:6px;margin-top:6px"><button class="btn sm" data-feed-view="${f.id}">Open</button><button class="btn sm" data-feed-retry="${f.id}">Try again</button></span>` : ''}</td></tr>`;
   }).join('');
   return `<div class="card pad" id="feed-card" style="margin-bottom:16px">
     <div class="head" style="margin-bottom:6px"><h2>Automatic sales feed</h2><span class="spacer"></span>
@@ -2470,6 +2491,33 @@ function wireFeedCard(handle) {
   };
   const settings = $('#feed-settings');
   if (settings) settings.onclick = () => feedSettingsDialog(feed);
+  // A report that couldn't be read: open it to look at, or read it again (after an update).
+  for (const btn of $$('[data-feed-view]', card)) {
+    btn.onclick = async () => {
+      const win = window.open('', '_blank');
+      try {
+        const f = await api(`/feed/files/${btn.dataset.feedView}`);
+        const url = URL.createObjectURL(new Blob([b64ToBuffer(f.data)], { type: f.content_type || (/\.pdf$/i.test(f.filename) ? 'application/pdf' : 'application/octet-stream') }));
+        if (win) win.location = url;
+        else Object.assign(document.createElement('a'), { href: url, download: f.filename }).click();
+      } catch (err) {
+        if (win) win.close();
+        toast(err.message);
+      }
+    };
+  }
+  for (const btn of $$('[data-feed-retry]', card)) {
+    btn.onclick = async () => {
+      btn.disabled = true;
+      try {
+        await api('/feed/results', { method: 'PUT', body: { results: [{ id: Number(btn.dataset.feedRetry), status: 'new', note: null }] } });
+        await syncFeed(null, true);
+      } catch (err) {
+        toast(err.message);
+      }
+      render();
+    };
+  }
   for (const btn of $$('[data-feed-open]', card)) {
     btn.onclick = async () => {
       btn.disabled = true;

@@ -2092,7 +2092,7 @@ async function feedInfo(env, companyId, origin) {
   const s = await feedSettings(env, companyId);
   const domain = feedDomain(env, s);
   const { results } = await env.DB.prepare(
-    `SELECT id, received_at, via, sender, subject, filename, size, status, note, processed_at FROM inbox
+    `SELECT id, received_at, via, sender, subject, filename, size, status, note, processed_at, data IS NOT NULL AS kept FROM inbox
      WHERE company_id = ? ORDER BY received_at DESC, id DESC LIMIT 60`
   )
     .bind(companyId)
