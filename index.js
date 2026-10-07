@@ -1333,6 +1333,7 @@ async function dipHistory(env, companyId, tankId) {
     const key = `${tank.site_id}|${tank.grade_id}`;
     for (let i = 0; i < results.length - 1; i++) {
       if (results[i].taken_at < oldestAt) break;
+      if (results[i].source !== 'delivery') continue;
       const e = expectedLevel(model, key, share, results[i + 1], results[i].taken_at, drops);
       if (e) Object.assign(results[i], { expected: Math.round(e.level), reported: checkable(e.sold, e.forecast) });
     }
@@ -1892,9 +1893,11 @@ async function runoutBoard(env, companyId) {
         parts.set(t.id, p);
         // The tank's estimated level now (needs sales to work from).
         if (fc) t.est = { level: Math.max(0, Math.round(p.level)), sold: Math.round(p.actual + p.forecast), sold_estimated: Math.round(p.forecast), delivered: Math.round(into) };
-        // Dip check: what the latest dip should have read, going from the dip before it.
+        // Dip check, for dips taken after a delivery: what it should have read, going from the
+        // dip before it. Dips entered by the office are readings from the site and stand as
+        // they are.
         const prev = prevOf.get(t.id);
-        const e = expectedLevel(model, key, share, prev, t.dip.at, drops);
+        const e = t.dip.source === 'delivery' ? expectedLevel(model, key, share, prev, t.dip.at, drops) : null;
         if (e) Object.assign(t.dip, { expected: Math.round(e.level), prev_at: prev.taken_at, prev_litres: prev.litres, sold_between: e.sold, forecast_between: e.forecast });
       }
       // The grade as a whole, when its tanks were dipped together: a delivery or the sales

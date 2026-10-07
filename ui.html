@@ -836,7 +836,7 @@ const SETTINGS = [
   ]],
   ['Dips', [
     { k: 'dip_stale_hours', label: 'A dip is out of date after', suffix: 'hours', step: 'any', hint: 'Tanks with older dips are flagged on the Dips screen.' },
-    { k: 'dip_check_l', label: 'Flag a dip that’s off by more than', suffix: 'L', step: 1, hint: 'Each new dip is compared with the dip before it, less the sales since, plus any delivery. Bigger differences are flagged.' },
+    { k: 'dip_check_l', label: 'Flag an after-delivery dip that’s off by more than', suffix: 'L', step: 1, hint: 'Each dip taken after a delivery is compared with the dip before it, less the sales since, plus the delivery. Dips entered by the office are taken as correct.' },
   ]],
   ['Paperwork', [
     { k: 'paperwork_keep_days', label: 'Keep drivers’ paperwork for', suffix: 'days', step: 1, hint: 'Photos and PDFs are deleted after this. The litres delivered and the dips are kept.' },
