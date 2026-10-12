@@ -99,6 +99,8 @@
   .level span.was { opacity: 0.25; }
   .dip-was { color: var(--muted); font-size: 13px; margin-top: 2px; white-space: normal; }
   .dip-check { font-size: 13px; margin-top: 2px; white-space: normal; }
+  .plan-next { font-size: 13px; color: var(--muted); padding: 8px 0 2px; text-align: right; }
+  .plan-next strong { color: var(--text); }
   .linkish { background: none; border: 0; padding: 0; color: var(--accent-text); text-decoration: underline; cursor: pointer; font: inherit; }
   .drv-drop { border-top: 1px solid var(--border); padding-bottom: 14px; }
   .drop-load { margin: 2px 16px 8px; width: calc(100% - 32px); }
@@ -3044,14 +3046,19 @@ function dropDialog(run, siteId, tanksAll, gradesAll) {
 // Works out which grade goes in each compartment of one truck, for one or two stops.
 // Whole compartments, except that one compartment on a part can be short-filled to keep
 // that part within its weight limit. Each grade's total stays within the room its tanks
-// will have at arrival. Priorities, in order:
+// will have at arrival. Cover is the hours until a grade falls to its lowest level, from
+// the same day-by-day forecast as the board. Priorities, in order:
 //   1. The first stop's grades with the fewest hours of cover get fuel first (covers are
 //      compared from the lowest up, capped at PLAN_CAP_H, so a grade with plenty of fuel
 //      doesn't compete with one about to run low).
 //   2. The same for the second stop, with the compartments and weight the first stop leaves.
-//   3. The most litres on the truck.
-//   4. Longer cover overall.
+//   3. The rest of the load is spread so the sites last as long as possible: the grade that
+//      would run low soonest gets more, then the next (covers compared from the lowest up,
+//      across both stops). A slow seller isn't filled for weeks while another grade runs
+//      low in days.
+//   4. The most litres on the truck.
 const PLAN_CAP_H = 72;
+const CURVE_H = 24 * 45;
 
 // Compartments grouped by the part they're on and their size: identical compartments on
 // the same part are interchangeable.
@@ -3092,17 +3099,59 @@ function eachAllocation(classes, counts, rooms, visit) {
   byClass(0);
 }
 
+// Litres a grade sells, hour by hour from `at`, added up: curve[k] is what's sold in the
+// first k hours. From the board's day-by-day forecast, then its average past that.
+function salesCurve(group, at) {
+  const curve = new Float64Array(CURVE_H + 1);
+  const perDay = new Map((group.next_days || []).map((d) => [d.day, d.litres]));
+  let day = localIsoOf(at);
+  let a = dayStartMs(day);
+  let b = dayStartMs(addDays(day, 1));
+  const rateOf = () => (perDay.has(day) ? perDay.get(day) : group.avg_daily) / (b - a);
+  let rate = rateOf();
+  let total = 0;
+  for (let k = 1; k <= CURVE_H; k++) {
+    let t0 = at + (k - 1) * 3600000;
+    const t1 = at + k * 3600000;
+    while (t0 < t1) {
+      if (t0 >= b) {
+        day = addDays(day, 1);
+        a = b;
+        b = dayStartMs(addDays(day, 1));
+        rate = rateOf();
+      }
+      const e = Math.min(t1, b);
+      total += rate * (e - t0);
+      t0 = e;
+    }
+    curve[k] = total;
+  }
+  return curve;
+}
+
 // Hours until a grade falls to its lowest level after `add` litres go in.
 function coverHours(g, add) {
   if (!(g.rateH > 0)) return Infinity;
-  return (g.level + add - g.floor) / g.rateH;
+  const need = g.level + add - g.floor;
+  if (!g.curve || need <= 0) return need / g.rateH;
+  const c = g.curve;
+  if (c[CURVE_H] < need) return CURVE_H + (need - c[CURVE_H]) / g.rateH;
+  let lo = 1;
+  let hi = CURVE_H;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (c[mid] >= need) hi = mid; else lo = mid + 1;
+  }
+  const step = c[lo] - c[lo - 1];
+  return lo - 1 + (step > 0 ? (need - c[lo - 1]) / step : 1);
 }
 
-// Covers sorted from lowest up; `cap` rounds down to whole hours and caps them.
+// Covers sorted from lowest up, in whole hours; `cap` caps them at PLAN_CAP_H.
 function coverVector(grades, litres, cap) {
   const v = grades.map((g, j) => coverHours(g, litres[j]));
-  return v.map((h) => (cap ? Math.floor(Math.min(h, PLAN_CAP_H)) : Math.min(h, 1e9))).sort((a, b) => a - b);
+  return v.map((h) => Math.floor(cap ? Math.min(h, PLAN_CAP_H) : Math.min(h, 1e9))).sort((a, b) => a - b);
 }
+const joinCovers = (a, b) => [...a, ...b].sort((x, y) => x - y);
 
 function compareVectors(a, b) {
   for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] !== b[i]) return a[i] - b[i];
@@ -3178,9 +3227,9 @@ function bestForStop(classes, counts, stop, lim) {
     const { litres, kg } = weighLoad(classes, alloc, stop.grades, full, lim);
     const total = litres.reduce((a, b) => a + b, 0);
     const cand = { capped: coverVector(stop.grades, litres, true), total, full: coverVector(stop.grades, litres, false) };
-    if (!best || compareVectors(cand.capped, best.capped) > 0 ||
-        (compareVectors(cand.capped, best.capped) === 0 && (cand.total > best.total ||
-          (cand.total === best.total && compareVectors(cand.full, best.full) > 0)))) {
+    const c1 = best ? compareVectors(cand.capped, best.capped) : 1;
+    const c2 = best ? compareVectors(cand.full, best.full) : 1;
+    if (!best || c1 > 0 || (c1 === 0 && (c2 > 0 || (c2 === 0 && cand.total > best.total)))) {
       best = { ...cand, litres: litres.slice(), alloc: alloc.map((r) => r.slice()), kg };
     }
   });
@@ -3229,10 +3278,10 @@ function planTruck(comps, stops, limits) {
         const cand = { a, b };
         if (!pick) { pick = cand; continue; }
         const c1 = compareVectors(b.capped, pick.b.capped);
+        const c2 = compareVectors(joinCovers(a.full, b.full), joinCovers(pick.a.full, pick.b.full));
         const t1 = a.total + b.total;
         const t0 = pick.a.total + pick.b.total;
-        if (c1 > 0 || (c1 === 0 && (t1 > t0 || (t1 === t0 && (compareVectors(a.full, pick.a.full) > 0 ||
-            (compareVectors(a.full, pick.a.full) === 0 && compareVectors(b.full, pick.b.full) > 0)))))) pick = cand;
+        if (c1 > 0 || (c1 === 0 && (c2 > 0 || (c2 === 0 && t1 > t0)))) pick = cand;
       }
     }
   }
@@ -3324,6 +3373,7 @@ function stopNeeds(siteId, at) {
     grades.push({
       grade_id: g.grade_id, code: g.grade_code, group: g, level, floor: g.floor, fill_to: g.fill_to, capacity: g.capacity,
       room: Math.max(0, Math.floor(g.fill_to - level)), rateH: g.avg_daily / 24, density: density.get(g.grade_id) || DEFAULT_DENSITY,
+      curve: g.avg_daily > 0 ? salesCurve(g, Math.max(b.now, at)) : null,
     });
   }
   return { site: s, grades, skipped };
@@ -3527,16 +3577,26 @@ function stopSummaryHtml(d, i) {
   const st = d.stops[i];
   const n = stopNeeds(st.site_id, st.at);
   if (!n.grades.length) return '<div class="empty" style="padding:12px">No grades with a dip at this site.</div>';
+  // When the site next needs fuel after this drop: the first grade to reach its lowest
+  // level, less the board's extra margin.
+  let first = null;
+  const rows = n.grades.map((g) => {
+    const x = litresTo(d, i, g.grade_id);
+    const after = g.level + x;
+    const until = whenLevelC(g.group, st.at, after, g.floor);
+    if (until != null && g.group.avg_daily > 0 && (!first || until < first.until)) first = { until, code: g.code };
+    const over = x > g.room;
+    return `<tr${over ? ' class="over"' : ''}><td><span class="chip">${esc(g.code)}</span></td><td class="n">${fmtL(g.room)}</td>
+      <td class="n"><strong>${x ? fmtL(x) : '—'}</strong></td><td class="n hide-sm">${fmtL(after)} · ${pct(after, g.capacity)}%</td>
+      <td class="n">${until == null ? '21+ days' : until <= st.at ? '<span class="badge bad">Below lowest</span>' : `${esc(fmtDayOf(until))}<span class="sub">${esc(fmtTime(until))}</span>`}</td></tr>`;
+  }).join('');
+  const buffer = ((state.board.settings && state.board.settings.runout_buffer_h) || 0) * 3600000;
+  const next = first ? Math.max(st.at, first.until - buffer) : null;
   return `<table class="summary plan-table"><thead><tr><th>Grade</th><th class="n">Room at arrival</th><th class="n">Delivering</th><th class="n hide-sm">After drop</th><th class="n">Lasts until</th></tr></thead><tbody>
-    ${n.grades.map((g) => {
-      const x = litresTo(d, i, g.grade_id);
-      const after = g.level + x;
-      const until = whenLevelC(g.group, st.at, after, g.floor);
-      const over = x > g.room;
-      return `<tr${over ? ' class="over"' : ''}><td><span class="chip">${esc(g.code)}</span></td><td class="n">${fmtL(g.room)}</td>
-        <td class="n"><strong>${x ? fmtL(x) : '—'}</strong></td><td class="n hide-sm">${fmtL(after)} · ${pct(after, g.capacity)}%</td>
-        <td class="n">${until == null ? '21+ days' : until <= st.at ? '<span class="badge bad">Below lowest</span>' : `${esc(fmtDayOf(until))}<span class="sub">${esc(fmtTime(until))}</span>`}</td></tr>`;
-    }).join('')}</tbody></table>`;
+    ${rows}</tbody></table>
+    <div class="plan-next">${first
+      ? `Next delivery needed by <strong>${esc(fmtWhen(next))}</strong> · ${esc(first.code)} runs low first${next > st.at ? ` · ${(next - st.at) < 48 * 3600000 ? `${Math.round((next - st.at) / 3600000)} h` : `${(Math.round((next - st.at) / 8640000) / 10).toLocaleString('en-AU')} days`} after this drop` : ''}`
+      : 'No delivery needed for at least 21 days after this drop'}</div>`;
 }
 
 function siteOptions(selected, allowNone) {
