@@ -1796,8 +1796,10 @@ async function readIdealposTrend(buffer) {
   for (const pg of pages) {
     const heads = pg.filter((p) => (DATE.test(p.s) || p.s === 'Total') && p.y < items[0].y - 2);
     const dateHeads = heads.filter((p) => DATE.test(p.s)).sort((a, b) => a.x - b.x);
-    if (!dateHeads.length) continue;
-    const totalHead = heads.find((p) => p.s === 'Total' && p.x > dateHeads[dateHeads.length - 1].x);
+    // The Total column can end up on a page of its own when the dates fill the page before.
+    const totalHead = heads.find((p) => p.s === 'Total' && (!dateHeads.length || p.x > dateHeads[dateHeads.length - 1].x));
+    if (!dateHeads.length && !totalHead) continue;
+    const headY = Math.max(...[...dateHeads, totalHead].filter(Boolean).map((h) => h.y));
     // Columns, by their right-hand edge: figures are right-aligned under their heading.
     const cols = dateHeads.map((h) => {
       const [, d, mo, y] = h.s.match(DATE);
@@ -1812,7 +1814,7 @@ async function readIdealposTrend(buffer) {
     // blank counts as nothing sold; the totals checks below catch anything that isn't.
     const grid = rowYs.map(() => cols.map(() => []));
     for (const p of pg) {
-      if (p.y <= dateHeads[0].y + 2 || !NUM.test(p.s)) continue;
+      if (p.y <= headY + 2 || !NUM.test(p.s)) continue;
       let col = -1;
       let near = spacing / 2;
       cols.forEach((c, j) => { const d = Math.abs(p.x + p.w - c.right); if (d < near) { near = d; col = j; } });
@@ -2525,6 +2527,7 @@ function feedCardHtml(feed) {
   }).join('');
   return `<div class="card pad" id="feed-card" style="margin-bottom:16px">
     <div class="head" style="margin-bottom:6px"><h2>Automatic sales feed</h2><span class="spacer"></span>
+      ${feed.files.filter((f) => f.status === 'failed' && f.kept).length > 1 ? `<button class="btn sm" id="feed-retry-all">Try all again (${feed.files.filter((f) => f.status === 'failed' && f.kept).length})</button>` : ''}
       <button class="btn sm" id="feed-check">Check now</button>${isAdmin() ? '<button class="btn sm" id="feed-settings">Feed settings</button>' : ''}</div>
     ${feed.address
       ? `<p style="margin:0 0 8px">Email sales reports to this address and they load by themselves when the app is next opened:</p>
@@ -2550,6 +2553,18 @@ function wireFeedCard(handle) {
   };
   const settings = $('#feed-settings');
   if (settings) settings.onclick = () => feedSettingsDialog(feed);
+  const retryAll = $('#feed-retry-all');
+  if (retryAll) retryAll.onclick = async () => {
+    retryAll.disabled = true;
+    try {
+      const ids = feed.files.filter((f) => f.status === 'failed' && f.kept).map((f) => f.id);
+      await api('/feed/results', { method: 'PUT', body: { results: ids.map((id) => ({ id, status: 'new', note: null })) } });
+      await syncFeed(null, true);
+    } catch (err) {
+      toast(err.message);
+    }
+    render();
+  };
   // A report that couldn't be read: open it to look at, or read it again (after an update).
   for (const btn of $$('[data-feed-view]', card)) {
     btn.onclick = async () => {
