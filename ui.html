@@ -90,6 +90,8 @@
   .badge.ok { background: var(--ok-soft); color: var(--ok); }
   .badge.warn { background: var(--warn-soft); color: var(--warn); }
   .badge.bad { background: var(--danger-soft); color: var(--danger); }
+  .badge.load { background: var(--accent-soft); color: var(--accent-text); }
+  .run-trip { padding: 8px 16px 0; font-size: 13px; color: var(--muted); }
   .comps { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
   .comp { font-size: 12px; padding: 2px 8px; border: 1px solid var(--border); border-radius: 6px; font-variant-numeric: tabular-nums; }
   .comp b { color: var(--faint); font-weight: 600; margin-right: 4px; }
@@ -143,6 +145,8 @@
   .summary th.n { text-align: right; }
   .plan-start { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--muted); white-space: nowrap; }
   .plan-start input { width: auto; min-width: 140px; padding: 7px 9px; }
+  .plan-start select { width: auto; padding: 7px 9px; }
+  .plan-bar { display: flex; flex-wrap: wrap; gap: 10px 20px; align-items: center; margin: 0 0 18px; }
   .run { overflow: hidden; }
   .run-head { display: flex; gap: 10px; align-items: center; padding: 12px 16px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
   .run-head select { width: auto; min-width: 150px; font-weight: 600; }
@@ -829,7 +833,10 @@ const SETTINGS = [
     { k: 'runout_buffer_h', label: 'Extra margin', suffix: 'hours', step: 'any', hint: 'Brings every deliver-by time forward by this many hours. 0 means deliver by the time a tank reaches its lowest level.' },
     { k: 'min_drop_l', label: 'Minimum worthwhile drop', suffix: 'L', step: 1, hint: 'A site’s delivery window opens once its tanks together have room for this much.' },
     { k: 'mass_margin_kg', label: 'Keep loads under each weight limit by', suffix: 'kg', step: 1, hint: 'Room for a heavier batch of fuel than the grade’s density. 0 plans right up to the limit.' },
-    { k: 'split_km', label: 'Split a load only between sites within', suffix: 'km', step: 1, hint: 'Straight-line distance between the two sites. 0 means a load always goes to one site.' },
+    { k: 'split_km', label: 'Split a load only between sites within', suffix: 'km', step: 1, hint: 'Straight-line distance between the two sites. A load is only split when a site that’s due can’t get a load of its own in time. 0 means never split.' },
+    { k: 'day_start', label: 'First drops of the day from', type: 'time', hint: 'Where a plan for another day starts. You can change it on the Plan screen.' },
+    { k: 'day_end', label: 'Last drops of the day by', type: 'time', hint: 'A truck only gets another load if it can drop it by this time.' },
+    { k: 'reload_minutes', label: 'Time between loads', suffix: 'minutes', step: 1, hint: 'From the end of one drop to arriving at the next site with a new load. Only used when no terminal has a location; with one, the drive there and back and its load time are worked out.' },
     { k: 'whole_compartments', label: 'Drop whole compartments only, so nothing comes back on the truck', type: 'bool' },
   ]],
   ['Forecast', [
@@ -853,7 +860,7 @@ async function viewSettings() {
     const id = 'set_' + f.k;
     if (f.type === 'bool') return `<div class="field full"><label class="check"><input type="checkbox" id="${id}" name="${f.k}"${s[f.k] ? ' checked' : ''}${dis}> ${esc(f.label)}</label></div>`;
     if (f.type === 'select') return `<div class="field"><label for="${id}">${esc(f.label)}</label><select id="${id}" name="${f.k}"${dis}>${f.options.map((o) => `<option${o === s[f.k] ? ' selected' : ''}>${o}</option>`).join('')}</select></div>`;
-    if (f.type === 'text') return `<div class="field"><label for="${id}">${esc(f.label)}</label><input type="text" id="${id}" name="${f.k}" value="${esc(s[f.k])}"${dis}>${f.hint ? `<div class="hint">${esc(f.hint)}</div>` : ''}</div>`;
+    if (f.type === 'text' || f.type === 'time') return `<div class="field"><label for="${id}">${esc(f.label)}</label><input type="${f.type}" id="${id}" name="${f.k}" value="${esc(s[f.k])}"${dis}>${f.hint ? `<div class="hint">${esc(f.hint)}</div>` : ''}</div>`;
     const v = f.pct ? Math.round(s[f.k] * 1000) / 10 : s[f.k];
     return `<div class="field"><label for="${id}">${esc(f.label)}</label><div class="suffix"><input type="number" inputmode="decimal" step="${f.pct ? 'any' : f.step}" id="${id}" name="${f.k}" value="${esc(v)}"${dis}><span>${esc(f.suffix)}</span></div>${f.hint ? `<div class="hint">${esc(f.hint)}</div>` : ''}</div>`;
   }).join('')}</div></div>`;
@@ -868,7 +875,7 @@ async function saveSettings(form) {
   for (const [, fields] of SETTINGS) for (const f of fields) {
     const el = form.elements[f.k];
     if (f.type === 'bool') body[f.k] = el.checked;
-    else if (f.type === 'select' || f.type === 'text') body[f.k] = el.value;
+    else if (f.type === 'select' || f.type === 'text' || f.type === 'time') body[f.k] = el.value;
     else {
       const v = el.value === '' ? null : Number(el.value);
       if (f.pct && (v == null || v < f.min || v > f.max)) throw new Error(`${f.label} must be between ${f.min}% and ${f.max}%.`);
@@ -2047,7 +2054,7 @@ function boardSiteHtml(s, b) {
   return `<div class="card board-site" data-status="${s.status}" data-name="${esc(s.name.toLowerCase())}" data-flags="${s.warnings.length ? 1 : 0}">
     <div class="bs-head">
       <div class="bs-title"><a href="#/sites/${s.id}">${esc(s.name)}</a><span class="badge ${kind}">${label}</span>
-        ${(state.boardRuns || []).filter((r) => r.status === 'planned').flatMap((r) => r.plan.stops.filter((st) => st.site_id === s.id).map((st) => `<a class="badge ok" href="#/plan" style="text-decoration:none">Run planned · ${esc(r.plan.truck_name)} · ${esc(fmtTime(st.at))}</a>`)).join('')}</div>
+        ${(state.boardRuns || []).filter((r) => r.status === 'planned').flatMap((r) => r.plan.stops.filter((st) => st.site_id === s.id).map((st) => `<a class="badge ok" href="#/plan" style="text-decoration:none">Run planned · ${esc(r.plan.truck_name)} · ${r.run_date > state.board.today ? 'tomorrow ' : ''}${esc(fmtTime(st.at))}</a>`)).join('')}</div>
       <div class="bs-when">${when}</div>
       <div class="bs-meta">${[partial, opens, s.room_now ? `${fmtL(s.room_now)} room now` : '', s.sales_part_at != null ? `sales to ${esc(salesTimeLabel(s.sales_part_at, b))}` : s.sales_to ? `sales to ${esc(fmtDayShort(s.sales_to))}` : ''].filter(Boolean).join(' · ')}</div>
     </div>
@@ -2059,7 +2066,7 @@ function boardSiteHtml(s, b) {
 async function viewBoard() {
   const b = await api('/board');
   state.board = b;
-  try { state.boardRuns = await api(`/runs?date=${b.today}`); } catch { state.boardRuns = []; }
+  try { state.boardRuns = await api(`/runs?from=${b.today}&to=${addDays(b.today, 1)}`); } catch { state.boardRuns = []; }
   const count = (st) => b.sites.filter((s) => s.status === st).length;
   const flagged = b.sites.filter((s) => s.warnings.length && s.groups.length).length;
   const salesTo = b.sites.map((s) => s.sales_to).filter(Boolean).sort();
@@ -3242,17 +3249,22 @@ function weighLoad(classes, alloc, grades, litres, lim) {
   return { litres: t.litres, kg: t.kg };
 }
 
-// Best load for one stop from the compartments in `counts`. Returns its score and litres per grade.
+// Compartments an allocation uses.
+const allocCount = (alloc) => alloc.reduce((a, row) => a + row.reduce((x, y) => x + y, 0), 0);
+
+// Best load for one stop from the compartments in `counts`. Returns its score and litres per
+// grade. Between loads that do equally well, the one using fewer compartments: when weight
+// is the limit, more compartments would only mean more of them short-filled.
 function bestForStop(classes, counts, stop, lim) {
   const rooms = stop.grades.map((g) => Math.max(0, g.room));
   let best = null;
   eachAllocation(classes, counts, rooms, (alloc, full) => {
     const { litres, kg } = weighLoad(classes, alloc, stop.grades, full, lim);
     const total = litres.reduce((a, b) => a + b, 0);
-    const cand = { capped: coverVector(stop.grades, litres, true), total, full: coverVector(stop.grades, litres, false) };
+    const cand = { capped: coverVector(stop.grades, litres, true), total, full: coverVector(stop.grades, litres, false), n: allocCount(alloc) };
     const c1 = best ? compareVectors(cand.capped, best.capped) : 1;
     const c2 = best ? compareVectors(cand.full, best.full) : 1;
-    if (!best || c1 > 0 || (c1 === 0 && (c2 > 0 || (c2 === 0 && cand.total > best.total)))) {
+    if (!best || c1 > 0 || (c1 === 0 && (c2 > 0 || (c2 === 0 && (cand.total > best.total || (cand.total === best.total && cand.n < best.n)))))) {
       best = { ...cand, litres: litres.slice(), alloc: alloc.map((r) => r.slice()), kg };
     }
   });
@@ -3304,7 +3316,8 @@ function planTruck(comps, stops, limits) {
         const c2 = compareVectors(joinCovers(a.full, b.full), joinCovers(pick.a.full, pick.b.full));
         const t1 = a.total + b.total;
         const t0 = pick.a.total + pick.b.total;
-        if (c1 > 0 || (c1 === 0 && (c2 > 0 || (c2 === 0 && t1 > t0)))) pick = cand;
+        const fewer = allocCount(a.alloc) + b.n < allocCount(pick.a.alloc) + pick.b.n;
+        if (c1 > 0 || (c1 === 0 && (c2 > 0 || (c2 === 0 && (t1 > t0 || (t1 === t0 && fewer)))))) pick = cand;
       }
     }
   }
@@ -3382,7 +3395,28 @@ function whenLevelC(g, t0, level0, target) {
   return null;
 }
 
-// What a site's tanks can take, grade by grade, if a truck arrives at `at`.
+// Fuel on confirmed runs that isn't recorded as delivered yet, by site. It counts from when
+// the run gets there, so a plan for tomorrow allows for today's runs still to be marked done.
+function buildIncoming() {
+  const m = new Map();
+  for (const r of state.planRunsAll || []) {
+    if (r.status !== 'planned') continue;
+    const progress = r.progress || {};
+    r.plan.stops.forEach((st, i) => {
+      if (progress[st.site_id] || (r.delivered || []).some((x) => x.site_id === st.site_id)) return;
+      for (const c of r.plan.compartments) {
+        if (c.stop !== i) continue;
+        if (!m.has(st.site_id)) m.set(st.site_id, []);
+        m.get(st.site_id).push({ grade_id: c.grade_id, litres: c.litres, at: st.at });
+      }
+    });
+  }
+  state.incoming = m;
+}
+const incomingTo = (siteId) => (state.incoming && state.incoming.get(siteId)) || [];
+
+// What a site's tanks can take, grade by grade, if a truck arrives at `at`: the level now,
+// less the forecast sales until then, plus fuel on confirmed runs that get there first.
 function stopNeeds(siteId, at) {
   const b = state.board;
   const s = b.sites.find((x) => x.id === siteId);
@@ -3390,9 +3424,12 @@ function stopNeeds(siteId, at) {
   const skipped = [];
   if (!s) return { site: null, grades, skipped };
   const density = new Map((state.cache.grades || []).map((g) => [g.id, g.density]));
+  const incoming = incomingTo(siteId);
   for (const g of s.groups) {
     if (g.level == null) { skipped.push(g.grade_code); continue; }
-    const level = Math.max(0, g.level - soldBetweenC(g, b.now, Math.max(b.now, at)));
+    let level = Math.max(0, g.level - soldBetweenC(g, b.now, Math.max(b.now, at)));
+    for (const x of incoming) if (x.grade_id === g.grade_id && x.at <= at) level += x.litres;
+    if (g.capacity) level = Math.min(level, g.capacity);
     grades.push({
       grade_id: g.grade_id, code: g.grade_code, group: g, level, floor: g.floor, fill_to: g.fill_to, capacity: g.capacity,
       room: Math.max(0, Math.floor(g.fill_to - level)), rateH: g.avg_daily / 24, density: density.get(g.grade_id) || DEFAULT_DENSITY,
@@ -3429,20 +3466,29 @@ function optimiseDraft(d) {
     const hit = plan.find((p) => p.position === i + 1);
     return { position: i + 1, capacity: c, unit: units[i], litres: 0, target: hit ? { stop: hit.stop, grade_id: hit.grade_id } : null };
   });
-  topUpDraft(d, needs);
   d.manual = false;
-  applyWeights(d);
+  applyWeights(d, needs);
+  topUpDraft(d, needs);
+  applyWeights(d, needs);
+  // A compartment the weight limits leave nothing in isn't used at all.
+  for (const c of d.comps) if (c.target && c.litres <= 0) c.target = null;
 }
 
 // Tops tanks right up. Where a grade still has room but no whole compartment fits it, a
 // compartment left empty is part-filled at the terminal with just what fits (at least
 // TOPUP_MIN_L), and dropped whole at that site. Each goes where it helps most, the same way
-// as the plan: grades running lowest first, then spreading the rest.
+// as the plan: grades running lowest first, then spreading the rest. A top-up only uses
+// weight the truck has left, so it never pushes the load over a limit.
 const TOPUP_MIN_L = 1000;
 function topUpDraft(d, needs) {
   const stops = needs.map((n) => n.grades);
+  const truck = (state.cache.trucks || []).find((t) => t.id === d.truck_id);
+  const limits = truck ? truckLimits(truck) : null;
+  const lim = limits && limits.any ? limits : null;
+  const kg = (d.kg || [0, 0, 0]).slice();
+  const kgRoom = (unit) => (lim ? Math.min(lim.parts[unit] - kg[unit], lim.total - sum3(kg)) : Infinity);
   const loaded = (i, gid) => d.comps.filter((c) => c.target && c.target.stop === i && c.target.grade_id === gid)
-    .reduce((a, c) => a + (c.target.fill || c.capacity), 0);
+    .reduce((a, c) => a + c.litres, 0);
   for (let guard = 0; guard < d.comps.length; guard++) {
     const spare = d.comps.filter((c) => !c.target);
     if (!spare.length) return;
@@ -3450,10 +3496,15 @@ function topUpDraft(d, needs) {
     stops.forEach((grades, i) => grades.forEach((g) => {
       const left = Math.floor((g.room - loaded(i, g.grade_id)) / 100) * 100;
       if (left < TOPUP_MIN_L) return;
-      // The smallest empty compartment that takes it all, else the biggest.
-      const c = spare.filter((x) => x.capacity >= left).sort((x, y) => x.capacity - y.capacity)[0]
-        || spare.slice().sort((x, y) => y.capacity - x.capacity)[0];
-      const amount = Math.min(c.capacity, left);
+      // The smallest empty compartment that takes it all, else the biggest, of those with
+      // weight to spare.
+      const fits = spare.map((x) => ({ x, most: Math.min(x.capacity, Math.floor(kgRoom(x.unit || 0) / densityOf(g) / 100) * 100) }))
+        .filter((f) => f.most >= TOPUP_MIN_L);
+      if (!fits.length) return;
+      const pickC = fits.filter((f) => f.most >= left).sort((p, q) => p.x.capacity - q.x.capacity)[0]
+        || fits.slice().sort((p, q) => q.most - p.most || q.x.capacity - p.x.capacity)[0];
+      const c = pickC.x;
+      const amount = Math.min(pickC.most, left);
       const covers = stops.map((gs, si) => {
         const litres = gs.map((x) => loaded(si, x.grade_id) + (si === i && x.grade_id === g.grade_id ? amount : 0));
         return { capped: coverVector(gs, litres, true), full: coverVector(gs, litres, false) };
@@ -3467,13 +3518,15 @@ function topUpDraft(d, needs) {
     }));
     if (!best) return;
     best.c.target = { stop: best.i, grade_id: best.g.grade_id, ...(best.amount < best.c.capacity ? { fill: best.amount } : {}) };
+    best.c.litres = best.amount;
+    kg[best.c.unit || 0] += best.amount * densityOf(best.g);
   }
 }
 
 // Litres in each compartment of a draft: full, except where fuel has to be held back to
 // keep the truck within its weight limits. The first stop's load is weighed first, then the
 // second stop gets what's left. Also records the fuel weight on each part (d.kg).
-function applyWeights(d) {
+function applyWeights(d, needs) {
   const truck = (state.cache.trucks || []).find((t) => t.id === d.truck_id);
   const gradeInfo = new Map((state.cache.grades || []).map((g) => [g.id, g]));
   const limits = truck ? truckLimits(truck) : null;
@@ -3481,7 +3534,7 @@ function applyWeights(d) {
   d.kg = [0, 0, 0];
   for (const c of d.comps) c.litres = c.target ? Math.min(c.capacity, c.target.fill || c.capacity) : 0;
   d.stops.forEach((st, i) => {
-    const grades = stopNeeds(st.site_id, st.at).grades.slice();
+    const grades = (needs ? needs[i] : stopNeeds(st.site_id, st.at)).grades.slice();
     const index = new Map(grades.map((g, j) => [g.grade_id, j]));
     // Same order as the optimiser: bigger compartments first, then the truck before trailers.
     const comps = d.comps.filter((c) => c.target && c.target.stop === i)
@@ -3510,74 +3563,349 @@ function newDraft(truckId, stops) {
 
 const litresTo = (d, stop, gradeId) => d.comps.filter((c) => c.target && c.target.stop === stop && c.target.grade_id === gradeId).reduce((a, c) => a + c.litres, 0);
 
-// Suggests a run for each free truck: the most urgent site first, then a second stop
-// nearby with whatever compartments are left.
-function suggestRuns() {
+/* ------------------------------------------------- a day of loads */
+// The day being planned, with its first and last drop times. Trucks do as many loads as
+// fit in between: after each drop they go back to a terminal, load, and go out again.
+function planUntil() { return Math.max(state.planEnd, state.planStart); }
+function choosePlanDay(day) {
   const b = state.board;
-  const start = state.planStart;
-  const sitesById = new Map((state.cache.sites || []).map((s) => [s.id, s]));
-  const confirmed = (state.planRuns || []).filter((r) => r.status === 'planned');
-  const coveredSites = new Set(confirmed.flatMap((r) => r.plan.stops.map((st) => st.site_id)));
-  const busyTrucks = new Set(confirmed.map((r) => r.truck_id));
-  const live = b.sites.filter((s) => s.status !== 'unknown' && s.groups.some((g) => g.level != null) && !coveredSites.has(s.id));
-  const needy = live.filter((s) => ['overdue', 'today', 'soon'].includes(s.status)).sort((x, y) => x.deliver_by - y.deliver_by);
-  const extras = live.filter((s) => s.status === 'ok' && s.window_opens != null && s.deliver_by != null && s.deliver_by - b.now < 4 * 86400000)
-    .sort((x, y) => x.deliver_by - y.deliver_by);
-  const trucks = (state.cache.trucks || []).filter((t) => t.available && t.compartments.length && !busyTrucks.has(t.id))
-    .sort((x, y) => y.total_capacity_l - x.total_capacity_l);
-  const minDrop = state.settings.min_drop_l || 0;
-  const splitKm = state.settings.split_km ?? 40;
-  const used = new Set();
-  const drafts = [];
-  const arriveA = (s) => roundUp(Math.max(start, s.window_opens || start), 5);
-  const score = (d, stop) => {
-    const n = stopNeeds(d.stops[stop].site_id, d.stops[stop].at);
-    const litres = n.grades.map((g) => litresTo(d, stop, g.grade_id));
-    return { capped: coverVector(n.grades, litres, true), total: litres.reduce((a, x) => a + x, 0) };
-  };
-  for (const s of needy) {
-    if (used.has(s.id) || !trucks.length) continue;
-    const at = arriveA(s);
-    // The truck that does the most for this site; smaller trucks win ties.
-    let best = null;
-    for (const t of trucks) {
-      if (!siteAllows(sitesById.get(s.id), t)) continue;
-      const d = newDraft(t.id, [{ site_id: s.id, at }]);
-      const sc = score(d, 0);
-      const better = !best || compareVectors(sc.capped, best.sc.capped) > 0 ||
-        (compareVectors(sc.capped, best.sc.capped) === 0 && (sc.total > best.sc.total || (sc.total === best.sc.total && t.total_capacity_l < best.t.total_capacity_l)));
-      if (better) best = { d, sc, t };
-    }
-    if (!best || best.sc.total <= 0) continue;
-    used.add(s.id);
-    let draft = best.d;
-    // A second stop, if enough of the truck is left for a worthwhile drop.
-    const spare = best.t.total_capacity_l - best.sc.total;
-    // Weight left for a second stop, if the truck has limits.
-    const lim = truckLimits(best.t);
-    const kg = best.d.kg || [0, 0, 0];
-    const kgLeft = !lim.any ? Infinity : Math.min(lim.total - sum3(kg),
-      [0, 1, 2].reduce((a, u) => a + (unitsOf(best.t).includes(u) ? Math.max(0, lim.parts[u] - kg[u]) : 0), 0));
-    if (splitKm > 0 && spare >= minDrop && kgLeft >= minDrop * 0.7) {
-      const here = sitesById.get(s.id);
-      // The nearest site within the split distance that can take a worthwhile drop.
-      const candidates = [...needy, ...extras].filter((x) => !used.has(x.id) && siteAllows(sitesById.get(x.id), best.t))
-        .map((x) => ({ x, km: kmBetween(here, sitesById.get(x.id)) }))
-        .filter((c) => c.km != null && c.km <= splitKm)
-        .sort((p, q) => p.km - q.km)
-        .slice(0, 6);
-      for (const { x, km } of candidates) {
-        const drop = (here && here.drop_minutes) || 45;
-        const atB = roundUp(Math.max(at + (drop + (km * 1.3 / 75) * 60) * 60000, x.window_opens || 0), 5);
-        const two = newDraft(best.t.id, [{ site_id: s.id, at }, { site_id: x.id, at: atB }]);
-        const sb = score(two, 1);
-        if (sb.total >= minDrop) { draft = two; used.add(x.id); break; }
-      }
-    }
-    drafts.push(draft);
-    trucks.splice(trucks.indexOf(best.t), 1);
+  const st = state.settings || {};
+  state.planFor = day;
+  state.planDrafts = [];
+  const first = atFromTime(day, st.day_start || '05:00');
+  state.planStart = day === b.today ? Math.max(first, roundUp(b.now + 2 * 3600000, 15)) : first;
+  state.planEnd = atFromTime(day, st.day_end || '17:00');
+}
+// Today, unless it's too late in the day for another load: then tomorrow.
+function planSetup(b) {
+  if (state.planToday === b.today && state.planFor >= b.today) return;
+  state.planToday = b.today;
+  const end = atFromTime(b.today, (state.settings && state.settings.day_end) || '17:00');
+  choosePlanDay(roundUp(b.now + 2 * 3600000, 15) > end ? addDays(b.today, 1) : b.today);
+}
+
+const ROAD_FACTOR = 1.3;
+const ROAD_KMH = 75;
+const driveMs = (km) => ((km * ROAD_FACTOR) / ROAD_KMH) * 3600000;
+const siteInfo = (id) => (state.cache.sites || []).find((s) => s.id === id) || null;
+const dropMsAt = (id) => (((siteInfo(id) || {}).drop_minutes) || 45) * 60000;
+const placedTerminals = () => (state.cache.terminals || []).filter((t) => t.active !== 0 && t.lat != null && t.lng != null);
+const allDay = (from, until) => !from || !until || (from === '00:00' && until >= '23:59');
+
+// The first time from `at` that a site takes deliveries that day; null once it has shut for
+// the day. `loose` gives the time anyway.
+function openAt(siteId, at, loose) {
+  const s = siteInfo(siteId);
+  if (!s || allDay(s.delivery_from, s.delivery_until)) return at;
+  const day = localIsoOf(at);
+  const t = hhmm(at);
+  const from = s.delivery_from;
+  const until = s.delivery_until;
+  if (from <= until) {
+    if (t < from) return atFromTime(day, from);
+    return t > until && !loose ? null : at;
   }
-  state.planDrafts = drafts;
+  // Overnight hours, like 20:00 to 06:00.
+  return t > until && t < from ? atFromTime(day, from) : at;
+}
+
+// When a truck that finishes a drop at one site can be at the next with a new load: back to
+// whichever terminal gets it there soonest, loaded, and out again. Without a terminal
+// location, the company's time between loads.
+function reloadTrip(fromId, end, toId) {
+  const a = siteInfo(fromId);
+  const z = siteInfo(toId);
+  let best = null;
+  for (const t of placedTerminals()) {
+    const k1 = kmBetween(a, t);
+    const k2 = kmBetween(t, z);
+    if (k1 == null || k2 == null) continue;
+    let loadAt = end + driveMs(k1);
+    if (!allDay(t.open_from, t.open_until) && t.open_from <= t.open_until) {
+      const day = localIsoOf(loadAt);
+      if (loadAt < atFromTime(day, t.open_from)) loadAt = atFromTime(day, t.open_from);
+      else if (loadAt > atFromTime(day, t.open_until)) loadAt = atFromTime(addDays(day, 1), t.open_from);
+    }
+    const at = loadAt + (t.load_minutes != null ? t.load_minutes : 45) * 60000 + driveMs(k2);
+    if (!best || at < best.at) best = { at, terminal: t, loadAt };
+  }
+  if (best) return best;
+  const mins = state.settings && state.settings.reload_minutes != null ? state.settings.reload_minutes : 150;
+  return { at: end + mins * 60000, terminal: null, loadAt: null };
+}
+
+// A truck's loads on the plan day, in order: confirmed runs and suggested ones.
+function truckLoads(truckId) {
+  const items = [];
+  for (const r of state.planRuns || []) if (r.truck_id === truckId) items.push({ r, stops: r.plan.stops.map((st) => ({ site_id: st.site_id, at: st.at })) });
+  for (const d of state.planDrafts || []) if (d.truck_id === truckId) items.push({ d, stops: d.stops });
+  return items.sort((p, q) => p.stops[0].at - q.stops[0].at);
+}
+function loadEnd(item) {
+  const st = item.stops[item.stops.length - 1];
+  return { site_id: st.site_id, end: st.at + dropMsAt(st.site_id) };
+}
+
+// When a truck can be at a site with a load that follows `prev` (null for its first load of
+// the day): not before the first drops, nor before the site has room, and within the site's
+// delivery hours and the last drop time. Null if it can't; `loose` gives the time anyway.
+function arrivalAfter(prev, siteId, loose) {
+  const bs = state.board.sites.find((x) => x.id === siteId);
+  let at = state.planStart;
+  if (prev) {
+    const e = loadEnd(prev);
+    at = Math.max(at, reloadTrip(e.site_id, e.end, siteId).at);
+  }
+  if (!loose) at = Math.max(at, (bs && bs.window_opens) || 0);
+  at = openAt(siteId, at, loose);
+  if (at == null) return null;
+  at = roundUp(at, 5);
+  return !loose && at > planUntil() ? null : at;
+}
+
+// The truck's later loads moved back so each still follows the one before. `swap` puts
+// different stops in for one of its suggested loads. Returns the moves, or null if a load no
+// longer fits in the day (`loose` moves them anyway, but never `keep`, the load just changed).
+function retimeLoads(truckId, swap, loose, keep) {
+  const loads = truckLoads(truckId).map((x) => (swap && x.d === swap.d ? { d: x.d, stops: swap.stops } : x));
+  const moves = [];
+  for (let i = 1; i < loads.length; i++) {
+    const x = loads[i];
+    if (x.d && (x.d.manual || x.d === keep)) continue;
+    const need = arrivalAfter(loads[i - 1], x.stops[0].site_id, true);
+    if (need <= x.stops[0].at) continue;
+    if (!x.d) { if (loose) continue; return null; }
+    const delta = need - x.stops[0].at;
+    const stops = x.stops.map((st) => ({ ...st, at: st.at + delta }));
+    if (!loose && stops[stops.length - 1].at > planUntil()) return null;
+    loads[i] = { d: x.d, stops };
+    moves.push({ d: x.d, stops });
+  }
+  return moves;
+}
+function applyMoves(moves) {
+  for (const m of moves) { m.d.stops = m.stops; optimiseDraft(m.d); }
+}
+
+// When a site's first grade falls to its lowest level, or with `dry` runs out, allowing for
+// fuel on confirmed runs that hasn't been recorded yet. Null if not within three weeks.
+function siteLowAt(s, dry) {
+  const incoming = incomingTo(s.id);
+  if (!incoming.length) {
+    const times = s.groups.map((g) => (dry ? g.empty_at : g.floor_at)).filter((t) => t != null);
+    return times.length ? Math.min(...times) : null;
+  }
+  const now = state.board.now;
+  let first = null;
+  for (const g of s.groups) {
+    if (g.level == null || !(g.avg_daily > 0)) continue;
+    const target = dry ? 0 : g.floor;
+    let level = g.level;
+    let t = now;
+    let hit;
+    for (const x of incoming.filter((y) => y.grade_id === g.grade_id).sort((p, q) => p.at - q.at)) {
+      const at = Math.max(t, x.at);
+      const low = whenLevelC(g, t, level, target);
+      if (low != null && low < at) { hit = low; break; }
+      level = Math.max(0, level - soldBetweenC(g, t, at)) + x.litres;
+      t = at;
+    }
+    if (hit === undefined) hit = whenLevelC(g, t, level, target);
+    if (hit != null && (first == null || hit < first)) first = hit;
+  }
+  return first;
+}
+// When a site next needs a delivery: the board's deliver-by, put back by any fuel on
+// confirmed runs that hasn't been recorded yet.
+function siteDue(s) {
+  if (!incomingTo(s.id).length || s.deliver_by == null) return s.deliver_by;
+  const low = siteLowAt(s, false);
+  const b = state.board;
+  return low == null ? null : low - ((b.settings && b.settings.runout_buffer_h) || 0) * 3600000;
+}
+
+// Sites with a forecast that aren't on a confirmed run for the plan day, soonest due first,
+// with hours from the first drops until each is due.
+function planSites() {
+  const b = state.board;
+  const covered = new Set((state.planRuns || []).filter((r) => r.status === 'planned').flatMap((r) => r.plan.stops.map((st) => st.site_id)));
+  const from = Math.max(b.now, state.planStart);
+  return b.sites.filter((s) => s.status !== 'unknown' && s.groups.some((g) => g.level != null) && !covered.has(s.id))
+    .map((s) => { const due = siteDue(s); return { s, due, hrs: due == null ? null : (due - from) / 3600000 }; })
+    .filter((x) => x.due != null)
+    .sort((p, q) => p.due - q.due);
+}
+const PLAN_DUE_H = 48;
+const dueStatus = (hrs) => (hrs <= 0 ? 'overdue' : hrs <= 24 ? 'today' : hrs <= 48 ? 'soon' : 'ok');
+
+const coverScore = (d, stop) => {
+  const n = stopNeeds(d.stops[stop].site_id, d.stops[stop].at);
+  const litres = n.grades.map((g) => litresTo(d, stop, g.grade_id));
+  return { capped: coverVector(n.grades, litres, true), total: litres.reduce((a, x) => a + x, 0) };
+};
+
+// About how many litres a truck can carry, allowing for its weight limits.
+function truckCarryL(t) {
+  const lim = truckLimits(t);
+  const units = unitsOf(t);
+  let litres = 0;
+  for (let u = 0; u < 3; u++) {
+    const cap = t.compartments.reduce((a, c, i) => a + (units[i] === u ? c : 0), 0);
+    litres += Math.min(cap, Number.isFinite(lim.parts[u]) ? lim.parts[u] / 0.8 : Infinity);
+  }
+  return Number.isFinite(lim.total) ? Math.min(litres, lim.total / 0.8) : litres;
+}
+
+// The best load of its own for a site, from every available truck's next free slot. In
+// order: getting there by the time it's due (or soonest, if none can); a truck on fewer
+// loads so far, so each truck is used before any does another load (unless one already out
+// does much more for the site); the load that keeps the site going longest; the most
+// litres; the earliest; the smaller truck.
+function bestOwnLoad(s, due) {
+  let best = null;
+  for (const t of (state.cache.trucks || []).filter((x) => x.available && x.compartments.length)) {
+    if (!siteAllows(siteInfo(s.id), t)) continue;
+    const loads = truckLoads(t.id);
+    const at = arrivalAfter(loads[loads.length - 1] || null, s.id);
+    if (at == null) continue;
+    const d = newDraft(t.id, [{ site_id: s.id, at }]);
+    const sc = coverScore(d, 0);
+    if (sc.total <= 0) continue;
+    const cand = { t, d, sc, at, n: loads.length, late: due != null && at > due };
+    if (!best || betterOwn(cand, best)) best = cand;
+  }
+  return best;
+}
+function betterOwn(a, b) {
+  if (a.late !== b.late) return !a.late;
+  if (a.late && a.at !== b.at) return a.at < b.at;
+  // A truck already out wins over a free one only if it keeps the site going a good half
+  // day longer, like a big truck's second load to a big site over a small truck.
+  const gap = (a.sc.capped[0] ?? 0) - (b.sc.capped[0] ?? 0);
+  if (a.n !== b.n && Math.abs(gap) > 12) return gap > 0;
+  if (a.n !== b.n) return a.n < b.n;
+  const c = compareVectors(a.sc.capped, b.sc.capped);
+  if (c) return c > 0;
+  if (a.sc.total !== b.sc.total) return a.sc.total > b.sc.total;
+  if (a.at !== b.at) return a.at < b.at;
+  return a.t.total_capacity_l < b.t.total_capacity_l;
+}
+
+// A site as the second stop on a suggested load to a site nearby that has room left on the
+// truck. Only used when the site can't get a load of its own in time.
+function bestSplit(s, due) {
+  const splitKm = state.settings.split_km ?? 40;
+  const minDrop = state.settings.min_drop_l || 0;
+  if (!(splitKm > 0)) return null;
+  const here = siteInfo(s.id);
+  const bs = state.board.sites.find((x) => x.id === s.id);
+  let best = null;
+  for (const d of state.planDrafts || []) {
+    if (d.stops.length !== 1 || d.manual) continue;
+    const t = (state.cache.trucks || []).find((x) => x.id === d.truck_id);
+    if (!t || !siteAllows(here, t)) continue;
+    const A = d.stops[0];
+    const km = kmBetween(siteInfo(A.site_id), here);
+    if (km == null || km > splitKm) continue;
+    const loaded = d.comps.reduce((a, c) => a + (c.target ? c.litres : 0), 0);
+    if (t.total_capacity_l - loaded < minDrop) continue;
+    const lim = truckLimits(t);
+    const kg = d.kg || [0, 0, 0];
+    const kgLeft = !lim.any ? Infinity : Math.min(lim.total - sum3(kg),
+      [0, 1, 2].reduce((a, u) => a + (unitsOf(t).includes(u) ? Math.max(0, lim.parts[u] - kg[u]) : 0), 0));
+    if (kgLeft < minDrop * 0.7) continue;
+    let atB = openAt(s.id, Math.max(A.at + dropMsAt(A.site_id) + driveMs(km), (bs && bs.window_opens) || 0));
+    if (atB == null) continue;
+    atB = roundUp(atB, 5);
+    if (atB > planUntil()) continue;
+    const two = newDraft(t.id, [{ ...A }, { site_id: s.id, at: atB }]);
+    const sb = coverScore(two, 1);
+    if (sb.total < minDrop) continue;
+    // The truck's later loads move back for the extra stop, and still have to fit the day.
+    const moves = retimeLoads(t.id, { d, stops: two.stops });
+    if (!moves) continue;
+    const cand = { d, two, sb, at: atB, km, moves, late: due != null && atB > due };
+    if (!best || betterSplit(cand, best)) best = cand;
+  }
+  return best;
+}
+function betterSplit(a, b) {
+  if (a.late !== b.late) return !a.late;
+  if (a.late && a.at !== b.at) return a.at < b.at;
+  const c = compareVectors(a.sb.capped, b.sb.capped);
+  if (c) return c > 0;
+  if (a.sb.total !== b.sb.total) return a.sb.total > b.sb.total;
+  return a.km < b.km;
+}
+
+function sortDrafts() {
+  const name = (id) => ((state.cache.trucks || []).find((t) => t.id === id) || {}).name || '';
+  state.planDrafts.sort((p, q) => name(p.truck_id).localeCompare(name(q.truck_id), 'en-AU', { numeric: true }) || p.stops[0].at - q.stops[0].at);
+}
+
+// Suggests the day's loads. Sites due within 48 hours of the first drops, soonest first,
+// each get a load of their own: every truck's first load, then second loads, and so on while
+// they fit before the last drop time. A load is only split with a nearby site when that site
+// can't wait for tomorrow and can't get a load of its own, or would run out before its own
+// load got there. Trucks with time left then take sites due in the two days after that, when
+// they'd go out nearly full.
+function suggestRuns() {
+  state.planDrafts = [];
+  const sites = planSites();
+  const needy = sites.filter((x) => x.hrs <= PLAN_DUE_H);
+  const extras = sites.filter((x) => x.hrs > PLAN_DUE_H && x.hrs <= 2 * PLAN_DUE_H && x.s.window_opens != null);
+  // The next day's first drops: a site due after that can wait for a load of its own then.
+  const nextFirst = atFromTime(addDays(state.planFor, 1), (state.settings && state.settings.day_start) || '05:00');
+  const useSplit = (split) => {
+    state.planDrafts[state.planDrafts.indexOf(split.d)] = split.two;
+    applyMoves(split.moves);
+  };
+  const missed = [];
+  for (const x of needy) {
+    const own = bestOwnLoad(x.s, x.due);
+    if (own && !own.late) { state.planDrafts.push(own.d); continue; }
+    // A load of its own that's late is still better than a split, unless the site would
+    // run out before it got there and a split gets there sooner. A site that can wait for
+    // tomorrow's first loads isn't split in.
+    const dry = own ? siteLowAt(x.s, true) : null;
+    const urgent = x.due < nextFirst;
+    const split = urgent && (!own || (dry != null && own.at > dry)) ? bestSplit(x.s, x.due) : null;
+    if (split && (!own || split.at < own.at)) { useSplit(split); continue; }
+    if (own) state.planDrafts.push(own.d);
+    else missed.push(x);
+  }
+  // Loads added after a site was passed over may have room for it on the way.
+  for (const x of missed.filter((m) => m.due < nextFirst)) {
+    const split = bestSplit(x.s, x.due);
+    if (split) useSplit(split);
+  }
+  for (const { s, due } of extras) {
+    const own = bestOwnLoad(s, due);
+    if (own && own.sc.total >= 0.7 * truckCarryL(own.t)) state.planDrafts.push(own.d);
+  }
+  sortDrafts();
+}
+
+// Which load of the day a draft or run is for its truck, and how many it has.
+function loadPlace(truckId, item) {
+  const loads = truckLoads(truckId);
+  const i = loads.findIndex((x) => (item.key != null ? x.d === item : x.r === item));
+  if (i < 0) return { n: 0, of: 0, prev: null };
+  return { n: i + 1, of: loads.length, prev: i > 0 ? loads[i - 1] : null };
+}
+function loadBadge(truckId, item) {
+  const p = loadPlace(truckId, item);
+  return p.of > 1 ? `<span class="badge load">Load ${p.n} of ${p.of}</span>` : '';
+}
+// For a truck's second and later loads: where it's coming from and where it reloads.
+function tripHtml(truckId, item) {
+  const p = loadPlace(truckId, item);
+  if (!p.prev) return '';
+  const e = loadEnd(p.prev);
+  const first = (item.stops || item.plan.stops)[0];
+  const trip = reloadTrip(e.site_id, e.end, first.site_id);
+  const from = (siteInfo(e.site_id) || {}).name || 'its last drop';
+  return `<div class="run-trip">After ${esc(from)}, done about ${esc(fmtTime(e.end))}${trip.terminal ? `: reloads at ${esc(trip.terminal.name)} about ${esc(fmtTime(trip.loadAt))}` : ''}.</div>`;
 }
 
 function planWarnings(d) {
@@ -3585,6 +3913,14 @@ function planWarnings(d) {
   const truck = (state.cache.trucks || []).find((t) => t.id === d.truck_id);
   const sitesById = new Map((state.cache.sites || []).map((s) => [s.id, s]));
   if (truck && !truck.available) out.push(`${truck.name} is marked not available.`);
+  if (truck) {
+    const place = loadPlace(truck.id, d);
+    if (place.prev) {
+      const ready = arrivalAfter(place.prev, d.stops[0].site_id, true);
+      if (d.stops[0].at < ready - 60000) out.push(`${truck.name} won’t be back from its load before this one in time. It can be at the first stop by about ${fmtTime(ready)}.`);
+      if (d.stops[d.stops.length - 1].at > planUntil()) out.push(`This load drops after the last drop time of ${fmtTime(state.planEnd)}.`);
+    }
+  }
   d.stops.forEach((st, i) => {
     const n = stopNeeds(st.site_id, st.at);
     const site = sitesById.get(st.site_id);
@@ -3662,12 +3998,17 @@ function stopSummaryHtml(d, i) {
       : 'No delivery needed for at least 21 days after this drop'}</div>`;
 }
 
+// Sites to pick from, most urgent first. How soon each is due counts from the first drops.
 function siteOptions(selected, allowNone) {
   const b = state.board;
+  const from = Math.max(b.now, state.planStart || b.now);
   const rank = { overdue: 0, today: 1, soon: 2, ok: 3, unknown: 4 };
-  const sites = b.sites.filter((s) => s.groups.length).slice().sort((x, y) => rank[x.status] - rank[y.status] || x.name.localeCompare(y.name));
+  const sites = b.sites.filter((s) => s.groups.length).map((s) => {
+    const due = siteDue(s);
+    return { s, status: due == null ? (s.status === 'unknown' ? 'unknown' : 'ok') : dueStatus((due - from) / 3600000) };
+  }).sort((x, y) => rank[x.status] - rank[y.status] || x.s.name.localeCompare(y.s.name));
   return (allowNone ? `<option value="">No second stop</option>` : '') +
-    sites.map((s) => `<option value="${s.id}"${s.id === selected ? ' selected' : ''}>${esc(s.name)}${s.status === 'overdue' ? ' · overdue' : s.status === 'today' ? ' · within 24 h' : s.status === 'soon' ? ' · within 48 h' : ''}</option>`).join('');
+    sites.map(({ s, status }) => `<option value="${s.id}"${s.id === selected ? ' selected' : ''}>${esc(s.name)}${status === 'overdue' ? ' · overdue' : status === 'today' ? ' · within 24 h' : status === 'soon' ? ' · within 48 h' : ''}</option>`).join('');
 }
 
 function draftHtml(d) {
@@ -3701,10 +4042,12 @@ function draftHtml(d) {
   return `<div class="card run" data-draft="${d.key}">
     <div class="run-head">
       <select data-f="truck" aria-label="Truck">${trucks.map((t) => `<option value="${t.id}"${t.id === d.truck_id ? ' selected' : ''}>${esc(t.name)}${t.available ? '' : ' (not available)'}</option>`).join('')}</select>
+      ${loadBadge(d.truck_id, d)}
       <span class="muted num">${truck ? `${fmtL(total)} of ${fmtL(truck.total_capacity_l)}` : ''}${d.manual ? ' · changed by hand' : ''}</span>
       <span class="spacer"></span>
       <button class="btn sm ghost" data-act="draft-remove">Remove</button>
     </div>
+    ${tripHtml(d.truck_id, d)}
     ${stopRow(0)}${stopRow(1)}
     <div class="run-comps">${d.comps.map((c) => `<label class="run-comp${c.target ? '' : ' empty'}${c.target && c.litres < c.capacity ? ' part' : ''}"><span><b>C${c.position}</b> ${c.target && c.litres < c.capacity ? `${fmtN(c.litres)} of ${fmtN(c.capacity)} L` : `${fmtN(c.capacity)} L`}${split ? ` · ${UNIT_NAMES[c.unit || 0]}` : ''}</span>
       <select data-f="comp" data-pos="${c.position}">${optionsFor(c)}</select></label>`).join('') || '<span class="muted">This truck has no compartments set up.</span>'}</div>
@@ -3766,7 +4109,7 @@ function draftToRun(d) {
   const grades = new Map((state.cache.grades || []).map((g) => [g.id, g.code]));
   const siteName = (id) => (state.board.sites.find((s) => s.id === id) || {}).name || 'Unknown site';
   return {
-    run_date: state.board.today,
+    run_date: state.planFor || state.board.today,
     truck_id: d.truck_id,
     plan: {
       truck_name: truck ? truck.name : '', truck_rego: truck ? truck.rego : '',
@@ -3793,8 +4136,10 @@ function runCardHtml(r) {
   return `<div class="card run" data-run="${r.id}">
     <div class="run-head"><strong>${esc(p.truck_name || 'Truck')}</strong>
       <span class="badge ${r.status === 'done' ? 'off' : doneCount ? 'warn' : 'ok'}">${r.status === 'done' ? 'Done' : doneCount ? `${doneCount} of ${p.stops.length} drops done` : 'Confirmed'}</span>
+      ${r.truck_id ? loadBadge(r.truck_id, r) : ''}
       <span class="muted num">${fmtL(total)}</span><span class="spacer"></span>
       <button class="btn sm ghost danger" data-act="run-delete">Delete</button></div>
+    ${r.truck_id ? tripHtml(r.truck_id, r) : ''}
     ${p.stops.map((st, i) => `<div class="run-stop"><span class="run-num">${i + 1}</span><strong>${esc(st.site_name)}</strong><span class="muted">about ${esc(fmtTime(st.at))}</span></div>
       <div class="run-comps" style="padding-top:0">${p.compartments.filter((c) => c.stop === i).map((c) => `<span class="comp"><b>C${c.position}</b>${esc(c.grade_code)} ${fmtN(c.litres)}${c.litres < c.capacity ? ' (part)' : ''}</span>`).join('')}</div>`).join('')}
     ${(() => { const w = runWeights(r); return w.length ? `<div class="run-weight">${w.map((x) => `<span>${esc(x.label)} <strong class="num">${tonnes2(x.gross)}</strong> of ${tonnes2(x.limit)} ${x.kind}</span>`).join('')}</div>` : ''; })()}
@@ -3808,54 +4153,75 @@ function runCardHtml(r) {
       return `<span>Delivered to ${esc(st.site_name)} <strong class="num">${fmtL(mine.reduce((a, d) => a + d.litres, 0))}</strong> at ${esc(fmtTime(at))}${prog && prog.by_name ? ` by ${esc(prog.by_name)}` : ''}${paper}</span>`;
     }).join('')}</div>` : ''}
     <div class="run-foot"><button class="btn" data-act="run-sheet">Copy load sheet</button>
-      ${r.status === 'done' ? '<button class="btn ghost" data-act="run-undone">Mark not done</button>' : '<button class="btn ghost" data-act="run-done">Mark done</button>'}</div>
+      ${r.status === 'done' ? '<button class="btn ghost" data-act="run-undone">Mark not done</button>' : state.board && r.run_date > state.board.today ? '' : '<button class="btn ghost" data-act="run-done">Mark done</button>'}</div>
   </div>`;
 }
 
 function uncoveredHtml() {
-  const b = state.board;
-  const covered = new Set([
-    ...(state.planRuns || []).filter((r) => r.status === 'planned').flatMap((r) => r.plan.stops.map((st) => st.site_id)),
-    ...(state.planDrafts || []).flatMap((d) => d.stops.map((st) => st.site_id)),
-  ]);
-  const left = b.sites.filter((s) => ['overdue', 'today', 'soon'].includes(s.status) && !covered.has(s.id));
+  const drafted = new Set((state.planDrafts || []).flatMap((d) => d.stops.map((st) => st.site_id)));
+  const left = planSites().filter((x) => x.hrs <= PLAN_DUE_H && !drafted.has(x.s.id));
   if (!left.length) return '';
-  return `<div class="section">${headHtml('Still needing fuel', 'Sites due within 48 hours that aren’t on a run yet.')}
-    <div class="card"><ul class="rows">${left.map((s) => `<li><div class="row" style="cursor:default"><div class="main"><div class="title">${esc(s.name)} <span class="badge ${STATUS[s.status][0]}">${STATUS[s.status][1]}</span></div>
-      <div class="meta">${s.deliver_by <= b.now + 60000 ? 'Deliver now' : `Deliver by ${esc(fmtWhen(s.deliver_by))}`}</div></div>
-      <button class="btn sm" data-act="draft-add" data-site="${s.id}">Add run</button></div></li>`).join('')}</ul></div></div>`;
+  return `<div class="section">${headHtml('Still needing fuel', 'Sites due within 48 hours of the first drops that aren’t on a run yet.')}
+    <div class="card"><ul class="rows">${left.map(({ s, due, hrs }) => {
+      const st = dueStatus(hrs);
+      return `<li><div class="row" style="cursor:default"><div class="main"><div class="title">${esc(s.name)} <span class="badge ${STATUS[st][0]}">${STATUS[st][1]}</span></div>
+      <div class="meta">${due <= state.board.now + 60000 ? 'Deliver now' : `Deliver by ${esc(fmtWhen(due))}`}</div></div>
+      <button class="btn sm" data-act="draft-add" data-site="${s.id}">Add run</button></div></li>`;
+    }).join('')}</ul></div></div>`;
 }
 
 function renderPlanBody() {
+  const runs = state.planRuns || [];
   const drafts = state.planDrafts || [];
+  // Planning ahead while earlier runs are still open: their fuel counts as delivered.
+  const open = (state.planRunsAll || []).filter((r) => r.run_date < state.planFor && r.status === 'planned');
+  $('#plan-runs').innerHTML = (open.length
+    ? `<div class="note" style="margin-bottom:16px">${plural(open.length, 'earlier run')} ${open.length === 1 ? 'isn’t' : 'aren’t'} marked done yet. ${open.length === 1 ? 'Its' : 'Their'} fuel is counted as delivered at the planned time. <button type="button" class="linkish" data-act="plan-today">Show today’s runs</button></div>`
+    : '') + (runs.length
+    ? `<div class="section" style="margin-top:0">${headHtml('Confirmed runs', '')}<div style="display:grid;gap:16px">${runs.map(runCardHtml).join('')}</div></div>`
+    : '');
+  const roughReload = !placedTerminals().length && drafts.some((d) => loadPlace(d.truck_id, d).n > 1);
   $('#plan-drafts').innerHTML = drafts.length
-    ? `${headHtml('Suggested runs', 'Not saved until you confirm them. Change a truck, stop or time and the loads are worked out again; change a compartment to override it.')}<div style="display:grid;gap:16px">${drafts.map(draftHtml).join('')}</div>`
+    ? `${headHtml('Suggested runs', 'Not saved until you confirm them. Change a truck, stop or time and the loads are worked out again; change a compartment to override it.')}
+      ${roughReload ? `<div class="note" style="margin-bottom:16px">Second loads allow a flat ${fmtN(state.settings.reload_minutes ?? 150)} minutes between drops, however far the sites are from the terminal. Add your terminal’s latitude and longitude on the <a href="#/terminals">Terminals</a> screen to have the drive back and out worked out.</div>` : ''}
+      <div style="display:grid;gap:16px">${drafts.map(draftHtml).join('')}</div>`
     : '';
   $('#plan-left').innerHTML = uncoveredHtml();
 }
 
+const isoDayLabel = (iso, opts = { weekday: 'short', day: 'numeric', month: 'short' }) =>
+  new Intl.DateTimeFormat('en-AU', { timeZone: 'UTC', ...opts }).format(new Date(iso + 'T00:00:00Z'));
+
 async function viewPlan() {
-  const [b] = await Promise.all([api('/board'), load('trucks', true), load('sites', true), load('grades', true)]);
+  const [b] = await Promise.all([api('/board'), load('trucks', true), load('sites', true), load('grades', true), load('terminals', true).catch(() => [])]);
   state.board = b;
-  state.planRuns = await api(`/runs?date=${b.today}`);
-  if (state.planDay !== b.today) {
-    state.planDay = b.today;
-    state.planDrafts = [];
-    state.planStart = roundUp(b.now + 2 * 3600000, 15);
-  }
+  planSetup(b);
+  state.planRunsAll = await api(`/runs?from=${b.today}&to=${state.planFor}`);
+  state.planRuns = state.planRunsAll.filter((r) => r.run_date === state.planFor);
+  buildIncoming();
   const free = (state.cache.trucks || []).filter((t) => t.available).length;
-  const due = b.sites.filter((s) => ['overdue', 'today', 'soon'].includes(s.status)).length;
-  const runs = state.planRuns || [];
-  return headHtml('Load plans', `${esc(new Intl.DateTimeFormat('en-AU', { timeZone: 'UTC', weekday: 'long', day: 'numeric', month: 'long' }).format(new Date(b.today + 'T00:00:00Z')))} · ${plural(free, 'truck')} available · ${plural(due, 'site')} due within 48 hours`,
-    `<label class="plan-start">First drops from <input type="time" id="plan-start" value="${hhmm(state.planStart)}"></label>
-     <button class="btn" data-act="draft-blank">Add run</button><button class="btn primary" data-act="plan-suggest">Suggest runs</button>`) +
-    `<div id="plan-root">
-      ${runs.length ? `<div class="section" style="margin-top:0">${headHtml('Confirmed runs', '')}<div style="display:grid;gap:16px">${runs.map(runCardHtml).join('')}</div></div>` : ''}
+  const due = planSites().filter((x) => x.hrs <= PLAN_DUE_H).length;
+  const runs = state.planRuns;
+  const days = Array.from({ length: 7 }, (_, i) => addDays(b.today, i));
+  const dayOpts = days.map((d, i) => `<option value="${d}"${d === state.planFor ? ' selected' : ''}>${i === 0 ? 'Today, ' : i === 1 ? 'Tomorrow, ' : ''}${esc(isoDayLabel(d))}</option>`).join('');
+  const terms = placedTerminals();
+  const reload = terms.length
+    ? `Between loads a truck goes back to ${terms.length === 1 ? esc(terms[0].name) : 'whichever terminal is quickest'}, loads (${terms.length === 1 ? `${fmtN(terms[0].load_minutes != null ? terms[0].load_minutes : 45)} minutes` : 'each terminal’s load time'}) and drives out again.`
+    : `Between loads a truck is allowed ${fmtN(state.settings.reload_minutes ?? 150)} minutes to get back, reload and reach the next site. Add your terminal’s location on the Terminals screen to have the trip worked out from distance instead.`;
+  return headHtml('Load plans', `${esc(isoDayLabel(state.planFor, { weekday: 'long', day: 'numeric', month: 'long' }))} · ${plural(free, 'truck')} available · ${plural(due, 'site')} due within 48 hours of the first drops`,
+    `<button class="btn" data-act="draft-blank">Add run</button><button class="btn primary" data-act="plan-suggest">Suggest runs</button>`) +
+    `<div class="plan-bar">
+      <label class="plan-start">Plan for <select id="plan-day">${dayOpts}</select></label>
+      <label class="plan-start">First drops from <input type="time" id="plan-start" value="${hhmm(state.planStart)}"></label>
+      <label class="plan-start">Last drops by <input type="time" id="plan-end" value="${hhmm(state.planEnd)}"></label>
+    </div>
+    <div id="plan-root">
+      <div id="plan-runs"></div>
       <div id="plan-drafts" class="section"></div>
-      ${!runs.length && !(state.planDrafts || []).length ? `<div class="card" id="plan-empty">${emptyHtml('No runs yet', 'Suggest runs fills each available truck, most urgent sites first. Loads use whole compartments and stay within the room each tank will have when the truck arrives. A compartment is only short-filled when that keeps the truck within its weight limits.')}</div>` : ''}
+      ${!runs.length && !(state.planDrafts || []).length ? `<div class="card" id="plan-empty">${emptyHtml('No runs yet', 'Suggest runs gives each site that’s due a load of its own, most urgent first, and gives trucks a second or third load while they can drop it by the last drop time. Levels are worked out for when each truck gets there, from the forecast sales. Loads use whole compartments and stay within the room each tank will have. A compartment is only short-filled when that keeps the truck within its weight limits.')}</div>` : ''}
       <div id="plan-left"></div>
     </div>
-    <p class="muted" style="font-size:13px;margin-top:16px">Arrival times are estimates you can change. A second stop is added when there’s room left on the truck for at least ${fmtL(state.settings.min_drop_l)} at a site within ${fmtN(state.settings.split_km ?? 40)} km (change this in Settings). Travel between stops is estimated from straight-line distance.</p>`;
+    <p class="muted" style="font-size:13px;margin-top:16px">Arrival times are estimates you can change. Each truck takes as many loads as it can drop by the last drop time. ${reload} A load is only split between two sites within ${fmtN(state.settings.split_km ?? 40)} km when a site that’s due can’t get a load of its own in time (change this in Settings). Travel is estimated from straight-line distance.</p>`;
 }
 
 function wirePlan() {
@@ -3864,8 +4230,14 @@ function wirePlan() {
   renderPlanBody();
   const draftOf = (el) => (state.planDrafts || []).find((d) => d.key === Number(el.closest('[data-draft]').dataset.draft));
   const rerender = () => { const e = $('#plan-empty'); if (e) e.remove(); renderPlanBody(); };
+  $('#plan-day').onchange = (e) => { choosePlanDay(e.target.value); render(); };
   $('#plan-start').onchange = (e) => {
-    if (e.target.value) state.planStart = atFromTime(state.board.today, e.target.value);
+    if (e.target.value) state.planStart = atFromTime(state.planFor, e.target.value);
+    rerender();
+  };
+  $('#plan-end').onchange = (e) => {
+    if (e.target.value) state.planEnd = atFromTime(state.planFor, e.target.value);
+    rerender();
   };
   root.addEventListener('change', (e) => {
     const el = e.target;
@@ -3879,14 +4251,13 @@ function wirePlan() {
       else if (d.stops[i]) d.stops[i].site_id = Number(el.value);
       else {
         const prev = d.stops[0];
-        const sitesById = new Map((state.cache.sites || []).map((s) => [s.id, s]));
-        const km = kmBetween(sitesById.get(prev.site_id), sitesById.get(Number(el.value))) || 30;
-        d.stops.push({ site_id: Number(el.value), at: roundUp(prev.at + (45 + (km * 1.3 / 75) * 60) * 60000, 5) });
+        const km = kmBetween(siteInfo(prev.site_id), siteInfo(Number(el.value)));
+        d.stops.push({ site_id: Number(el.value), at: roundUp(prev.at + dropMsAt(prev.site_id) + driveMs(km == null ? 30 : km), 5) });
       }
       if (d.stops.length === 2 && d.stops[0].site_id === d.stops[1].site_id) d.stops.splice(1);
       optimiseDraft(d);
     } else if (f === 'at') {
-      if (el.value) d.stops[Number(el.dataset.stop)].at = atFromTime(state.board.today, el.value);
+      if (el.value) d.stops[Number(el.dataset.stop)].at = atFromTime(state.planFor, el.value);
       optimiseDraft(d);
     } else if (f === 'comp') {
       const c = d.comps.find((x) => x.position === Number(el.dataset.pos));
@@ -3894,6 +4265,8 @@ function wirePlan() {
       d.manual = true;
       applyWeights(d);
     }
+    // The truck's later loads move back if this one now finishes later.
+    if (f !== 'comp') { applyMoves(retimeLoads(d.truck_id, null, true, d)); sortDrafts(); }
     rerender();
   });
   root.addEventListener('click', async (e) => {
@@ -3905,7 +4278,7 @@ function wirePlan() {
         const d = draftOf(btn);
         if (act === 'draft-remove') state.planDrafts.splice(state.planDrafts.indexOf(d), 1);
         if (act === 'draft-reset') optimiseDraft(d);
-        if (act === 'draft-sheet') return copyText(loadSheetText({ run_date: state.board.today, truck_id: d.truck_id, plan: draftToRun(d).plan }));
+        if (act === 'draft-sheet') return copyText(loadSheetText({ run_date: state.planFor, truck_id: d.truck_id, plan: draftToRun(d).plan }));
         if (act === 'draft-confirm') {
           const warns = planWarnings(d).filter((w) => /won’t fit|^Over weight/.test(w));
           if (warns.length && btn.dataset.confirm !== '1') {
@@ -3921,13 +4294,21 @@ function wirePlan() {
           return render();
         }
         rerender();
+      } else if (act === 'plan-today') {
+        choosePlanDay(state.board.today);
+        return render();
       } else if (act === 'draft-add') {
         const s = state.board.sites.find((x) => x.id === Number(btn.dataset.site));
-        const busy = new Set([...(state.planRuns || []).filter((r) => r.status === 'planned').map((r) => r.truck_id), ...state.planDrafts.map((d) => d.truck_id)]);
-        const truck = (state.cache.trucks || []).filter((t) => t.available && !busy.has(t.id)).sort((x, y) => y.total_capacity_l - x.total_capacity_l)[0] ||
-          (state.cache.trucks || [])[0];
-        if (!truck) return toast('Add a truck first.');
-        state.planDrafts.push(newDraft(truck.id, [{ site_id: s.id, at: roundUp(Math.max(state.planStart, s.window_opens || 0), 5) }]));
+        const own = bestOwnLoad(s, siteDue(s));
+        if (own) state.planDrafts.push(own.d);
+        else {
+          const truck = (state.cache.trucks || []).find((t) => t.available && t.compartments.length) || (state.cache.trucks || [])[0];
+          if (!truck) return toast('Add a truck first.');
+          const loads = truckLoads(truck.id);
+          state.planDrafts.push(newDraft(truck.id, [{ site_id: s.id, at: arrivalAfter(loads[loads.length - 1] || null, s.id, true) }]));
+          toast('No truck has time for another load by the last drop time. Check this one.');
+        }
+        sortDrafts();
         rerender();
       } else if (btn.closest('[data-run]')) {
         const id = Number(btn.closest('[data-run]').dataset.run);
@@ -4076,16 +4457,20 @@ function afterRender(route) {
         const e = $('#plan-empty');
         if (e) e.remove();
         renderPlanBody();
-        if (!state.planDrafts.length) toast('No runs to suggest: no free trucks, or no sites due within 48 hours.');
+        if (!state.planDrafts.length) toast('No runs to suggest: no sites due within 48 hours of the first drops, or no trucks free.');
       }, 20);
     };
     const blank = $('[data-act=draft-blank]');
     if (blank) blank.onclick = () => {
       const b = state.board;
-      const site = b.sites.find((x) => ['overdue', 'today', 'soon'].includes(x.status)) || b.sites.find((x) => x.groups.some((g) => g.level != null));
+      const drafted = new Set(state.planDrafts.flatMap((d) => d.stops.map((st) => st.site_id)));
+      const due = planSites().find((x) => !drafted.has(x.s.id));
+      const site = due ? due.s : b.sites.find((x) => x.groups.some((g) => g.level != null));
       const truck = (state.cache.trucks || []).find((t) => t.available) || (state.cache.trucks || [])[0];
       if (!site || !truck) return toast('Add sites with dips and a truck first.');
-      state.planDrafts.push(newDraft(truck.id, [{ site_id: site.id, at: roundUp(Math.max(state.planStart, site.window_opens || 0), 5) }]));
+      const loads = truckLoads(truck.id);
+      state.planDrafts.push(newDraft(truck.id, [{ site_id: site.id, at: arrivalAfter(loads[loads.length - 1] || null, site.id, true) }]));
+      sortDrafts();
       const e = $('#plan-empty');
       if (e) e.remove();
       renderPlanBody();

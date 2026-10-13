@@ -317,6 +317,13 @@ const MIGRATIONS = [
   [
     `ALTER TABLE settings ADD COLUMN split_km INTEGER NOT NULL DEFAULT 40`,
   ],
+  // v11: a truck can do more than one load a day. The usual first and last drop times, and
+  // how long a truck takes between loads when no terminal has a location to work it out.
+  [
+    `ALTER TABLE settings ADD COLUMN day_start TEXT NOT NULL DEFAULT '05:00'`,
+    `ALTER TABLE settings ADD COLUMN day_end TEXT NOT NULL DEFAULT '17:00'`,
+    `ALTER TABLE settings ADD COLUMN reload_minutes INTEGER NOT NULL DEFAULT 150`,
+  ],
 ];
 
 let schemaVersionSeen = 0;
@@ -817,6 +824,9 @@ const SETTINGS_FIELDS = {
   dip_stale_hours: { type: 'num', min: 1, max: 720, label: 'Dip out of date after' },
   dip_check_l: { type: 'int', min: 0, max: 100000, label: 'Flag a dip that’s off by more than' },
   split_km: { type: 'int', min: 0, max: 500, label: 'Split a load only between sites within' },
+  day_start: { type: 'time', label: 'First drops from' },
+  day_end: { type: 'time', label: 'Last drops by' },
+  reload_minutes: { type: 'int', min: 0, max: 1440, label: 'Time between loads' },
   paperwork_keep_days: { type: 'int', min: 1, max: 3650, label: 'Keep paperwork for' },
   mass_margin_kg: { type: 'int', min: 0, max: 5000, label: 'Weight margin' },
 };
