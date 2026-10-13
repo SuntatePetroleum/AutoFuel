@@ -829,6 +829,7 @@ const SETTINGS = [
     { k: 'runout_buffer_h', label: 'Extra margin', suffix: 'hours', step: 'any', hint: 'Brings every deliver-by time forward by this many hours. 0 means deliver by the time a tank reaches its lowest level.' },
     { k: 'min_drop_l', label: 'Minimum worthwhile drop', suffix: 'L', step: 1, hint: 'A site’s delivery window opens once its tanks together have room for this much.' },
     { k: 'mass_margin_kg', label: 'Keep loads under each weight limit by', suffix: 'kg', step: 1, hint: 'Room for a heavier batch of fuel than the grade’s density. 0 plans right up to the limit.' },
+    { k: 'split_km', label: 'Split a load only between sites within', suffix: 'km', step: 1, hint: 'Straight-line distance between the two sites. 0 means a load always goes to one site.' },
     { k: 'whole_compartments', label: 'Drop whole compartments only, so nothing comes back on the truck', type: 'bool' },
   ]],
   ['Forecast', [
@@ -3406,8 +3407,45 @@ function optimiseDraft(d) {
     const hit = plan.find((p) => p.position === i + 1);
     return { position: i + 1, capacity: c, unit: units[i], litres: 0, target: hit ? { stop: hit.stop, grade_id: hit.grade_id } : null };
   });
+  topUpDraft(d, needs);
   d.manual = false;
   applyWeights(d);
+}
+
+// Tops tanks right up. Where a grade still has room but no whole compartment fits it, a
+// compartment left empty is part-filled at the terminal with just what fits (at least
+// TOPUP_MIN_L), and dropped whole at that site. Each goes where it helps most, the same way
+// as the plan: grades running lowest first, then spreading the rest.
+const TOPUP_MIN_L = 1000;
+function topUpDraft(d, needs) {
+  const stops = needs.map((n) => n.grades);
+  const loaded = (i, gid) => d.comps.filter((c) => c.target && c.target.stop === i && c.target.grade_id === gid)
+    .reduce((a, c) => a + (c.target.fill || c.capacity), 0);
+  for (let guard = 0; guard < d.comps.length; guard++) {
+    const spare = d.comps.filter((c) => !c.target);
+    if (!spare.length) return;
+    let best = null;
+    stops.forEach((grades, i) => grades.forEach((g) => {
+      const left = Math.floor((g.room - loaded(i, g.grade_id)) / 100) * 100;
+      if (left < TOPUP_MIN_L) return;
+      // The smallest empty compartment that takes it all, else the biggest.
+      const c = spare.filter((x) => x.capacity >= left).sort((x, y) => x.capacity - y.capacity)[0]
+        || spare.slice().sort((x, y) => y.capacity - x.capacity)[0];
+      const amount = Math.min(c.capacity, left);
+      const covers = stops.map((gs, si) => {
+        const litres = gs.map((x) => loaded(si, x.grade_id) + (si === i && x.grade_id === g.grade_id ? amount : 0));
+        return { capped: coverVector(gs, litres, true), full: coverVector(gs, litres, false) };
+      });
+      const cand = { i, g, c, amount, a: covers[0].capped, b: covers[1] ? covers[1].capped : [], all: covers.reduce((acc, v) => joinCovers(acc, v.full), []) };
+      if (!best) { best = cand; return; }
+      const ca = compareVectors(cand.a, best.a);
+      const cb = compareVectors(cand.b, best.b);
+      const cu = compareVectors(cand.all, best.all);
+      if (ca > 0 || (ca === 0 && (cb > 0 || (cb === 0 && (cu > 0 || (cu === 0 && cand.amount > best.amount)))))) best = cand;
+    }));
+    if (!best) return;
+    best.c.target = { stop: best.i, grade_id: best.g.grade_id, ...(best.amount < best.c.capacity ? { fill: best.amount } : {}) };
+  }
 }
 
 // Litres in each compartment of a draft: full, except where fuel has to be held back to
@@ -3419,7 +3457,7 @@ function applyWeights(d) {
   const limits = truck ? truckLimits(truck) : null;
   const lim = limits && limits.any ? { parts: limits.parts.slice(), total: limits.total } : null;
   d.kg = [0, 0, 0];
-  for (const c of d.comps) c.litres = c.target ? c.capacity : 0;
+  for (const c of d.comps) c.litres = c.target ? Math.min(c.capacity, c.target.fill || c.capacity) : 0;
   d.stops.forEach((st, i) => {
     const grades = stopNeeds(st.site_id, st.at).grades.slice();
     const index = new Map(grades.map((g, j) => [g.grade_id, j]));
@@ -3432,7 +3470,7 @@ function applyWeights(d) {
       index.set(c.target.grade_id, grades.length);
       grades.push({ grade_id: c.target.grade_id, level: 0, floor: 0, rateH: 0, density: g.density || DEFAULT_DENSITY });
     }
-    const buckets = comps.map((c) => ({ unit: c.unit || 0, size: c.capacity, n: 1, j: index.get(c.target.grade_id), c }));
+    const buckets = comps.map((c) => ({ unit: c.unit || 0, size: c.litres, n: 1, j: index.get(c.target.grade_id), c }));
     const litres = grades.map((g, j) => buckets.reduce((a, b) => a + (b.j === j ? b.size : 0), 0));
     const t = trimToLimits(buckets, grades, litres, lim);
     buckets.forEach((b, k) => { b.c.litres = b.size - t.cut[k]; });
@@ -3466,6 +3504,7 @@ function suggestRuns() {
   const trucks = (state.cache.trucks || []).filter((t) => t.available && t.compartments.length && !busyTrucks.has(t.id))
     .sort((x, y) => y.total_capacity_l - x.total_capacity_l);
   const minDrop = state.settings.min_drop_l || 0;
+  const splitKm = state.settings.split_km ?? 40;
   const used = new Set();
   const drafts = [];
   const arriveA = (s) => roundUp(Math.max(start, s.window_opens || start), 5);
@@ -3497,11 +3536,13 @@ function suggestRuns() {
     const kg = best.d.kg || [0, 0, 0];
     const kgLeft = !lim.any ? Infinity : Math.min(lim.total - sum3(kg),
       [0, 1, 2].reduce((a, u) => a + (unitsOf(best.t).includes(u) ? Math.max(0, lim.parts[u] - kg[u]) : 0), 0));
-    if (spare >= minDrop && kgLeft >= minDrop * 0.7) {
+    if (splitKm > 0 && spare >= minDrop && kgLeft >= minDrop * 0.7) {
       const here = sitesById.get(s.id);
+      // The nearest site within the split distance that can take a worthwhile drop.
       const candidates = [...needy, ...extras].filter((x) => !used.has(x.id) && siteAllows(sitesById.get(x.id), best.t))
         .map((x) => ({ x, km: kmBetween(here, sitesById.get(x.id)) }))
-        .filter((c) => c.km != null && c.km <= 120)
+        .filter((c) => c.km != null && c.km <= splitKm)
+        .sort((p, q) => p.km - q.km)
         .slice(0, 6);
       for (const { x, km } of candidates) {
         const drop = (here && here.drop_minutes) || 45;
@@ -3645,7 +3686,8 @@ function draftHtml(d) {
     ${stopRow(0)}${stopRow(1)}
     <div class="run-comps">${d.comps.map((c) => `<label class="run-comp${c.target ? '' : ' empty'}${c.target && c.litres < c.capacity ? ' part' : ''}"><span><b>C${c.position}</b> ${c.target && c.litres < c.capacity ? `${fmtN(c.litres)} of ${fmtN(c.capacity)} L` : `${fmtN(c.capacity)} L`}${split ? ` · ${UNIT_NAMES[c.unit || 0]}` : ''}</span>
       <select data-f="comp" data-pos="${c.position}">${optionsFor(c)}</select></label>`).join('') || '<span class="muted">This truck has no compartments set up.</span>'}</div>
-    ${weights.length ? `<div class="run-weight">${weights.map((w) => `<span>${esc(w.label)} <strong class="num">${tonnes2(w.gross)}</strong> of ${tonnes2(w.limit)} ${w.kind}</span>`).join('')}${d.comps.some((c) => c.target && c.litres < c.capacity) ? '<span class="muted">Short-filled to stay within the limits</span>' : ''}</div>` : ''}
+    ${weights.length ? `<div class="run-weight">${weights.map((w) => `<span>${esc(w.label)} <strong class="num">${tonnes2(w.gross)}</strong> of ${tonnes2(w.limit)} ${w.kind}</span>`).join('')}${d.comps.some((c) => c.target && c.litres < Math.min(c.capacity, c.target.fill || c.capacity)) ? '<span class="muted">Short-filled to stay within the limits</span>' : ''}</div>` : ''}
+    ${d.comps.some((c) => c.target && c.target.fill) ? '<div class="run-weight"><span class="muted">Part-filled compartments top the tanks right up.</span></div>' : ''}
     ${warns.length ? `<ul class="bs-warn" style="margin:0">${warns.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}
     <div class="run-foot">
       <button class="btn primary" data-act="draft-confirm"${total ? '' : ' disabled'}>Confirm run</button>
@@ -3791,7 +3833,7 @@ async function viewPlan() {
       ${!runs.length && !(state.planDrafts || []).length ? `<div class="card" id="plan-empty">${emptyHtml('No runs yet', 'Suggest runs fills each available truck, most urgent sites first. Loads use whole compartments and stay within the room each tank will have when the truck arrives. A compartment is only short-filled when that keeps the truck within its weight limits.')}</div>` : ''}
       <div id="plan-left"></div>
     </div>
-    <p class="muted" style="font-size:13px;margin-top:16px">Arrival times are estimates you can change. A second stop is added when there’s room left on the truck for at least ${fmtL(state.settings.min_drop_l)} at a site within 120 km. Travel between stops is estimated from straight-line distance.</p>`;
+    <p class="muted" style="font-size:13px;margin-top:16px">Arrival times are estimates you can change. A second stop is added when there’s room left on the truck for at least ${fmtL(state.settings.min_drop_l)} at a site within ${fmtN(state.settings.split_km ?? 40)} km (change this in Settings). Travel between stops is estimated from straight-line distance.</p>`;
 }
 
 function wirePlan() {

@@ -313,6 +313,10 @@ const MIGRATIONS = [
     `CREATE INDEX IF NOT EXISTS idx_paperwork_run ON paperwork(run_id)`,
     `CREATE INDEX IF NOT EXISTS idx_dips_run ON dips(run_id)`,
   ],
+  // v10: how far apart two sites can be for one load to be split between them.
+  [
+    `ALTER TABLE settings ADD COLUMN split_km INTEGER NOT NULL DEFAULT 40`,
+  ],
 ];
 
 let schemaVersionSeen = 0;
@@ -812,6 +816,7 @@ const SETTINGS_FIELDS = {
   timezone: { type: 'text', max: 60, label: 'Time zone' },
   dip_stale_hours: { type: 'num', min: 1, max: 720, label: 'Dip out of date after' },
   dip_check_l: { type: 'int', min: 0, max: 100000, label: 'Flag a dip that’s off by more than' },
+  split_km: { type: 'int', min: 0, max: 500, label: 'Split a load only between sites within' },
   paperwork_keep_days: { type: 'int', min: 1, max: 3650, label: 'Keep paperwork for' },
   mass_margin_kg: { type: 'int', min: 0, max: 5000, label: 'Weight margin' },
 };
