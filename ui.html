@@ -1243,14 +1243,15 @@ async function enterDipsDialog(siteId) {
     body: `<div class="grid">
       <div class="field"><label for="dip_site">Site</label><select id="dip_site">${withTanks.map((s) => `<option value="${s.id}"${s.id === current ? ' selected' : ''}>${esc(s.name)}</option>`).join('')}</select></div>
       <div class="field"><label for="dip_time">Taken at</label><input type="datetime-local" id="dip_time" value="${nowLocal()}" max="${nowLocal()}"><div class="hint">When the tanks were dipped. Sales from this time on come off the dip.</div></div>
-    </div><div class="grid" id="dip_inputs" style="margin-top:14px">${inputs(current)}</div>`,
+    </div><div id="dip_later" style="margin-top:12px"></div><div class="grid" id="dip_inputs" style="margin-top:14px">${inputs(current)}</div>`,
     saveLabel: 'Save dips',
     onSave: async () => {
       const readings = $$('#dip_inputs input').filter((i) => i.value.trim() !== '').map((i) => ({ tank_id: Number(i.dataset.tank), litres: i.value.trim() }));
       if (!readings.length) throw new Error('Enter litres for at least one tank.');
       const when = $('#dip_time').value;
       if (!when) throw new Error('Enter when the dips were taken.');
-      const res = await api('/dips', { method: 'POST', body: { taken_at: when, readings } });
+      const replace = $('#dip_replace');
+      const res = await api('/dips', { method: 'POST', body: { taken_at: when, readings, replace_later: !!(replace && replace.checked) } });
       const site = withTanks.find((s) => s.id === current);
       state.flash = res.warnings.length
         ? { kind: 'warn', html: `Saved ${plural(res.saved, 'dip')} for ${esc(site.name)}, but check these:<ul>${res.warnings.map((w) => `<li>${esc(w)}</li>`).join('')}</ul>` }
@@ -1259,10 +1260,31 @@ async function enterDipsDialog(siteId) {
       render();
     },
   });
+  // A tank that already has a later dip keeps that one as its latest, so an earlier dip
+  // wouldn't change its level. Say so, and offer to replace later dips the office entered
+  // (within a day): the usual case is a dip first saved with the wrong time.
+  const checkLater = () => {
+    const box = $('#dip_later');
+    const v = $('#dip_time').value;
+    if (!box) return;
+    if (!v) { box.innerHTML = ''; return; }
+    const t0 = atFromTime(v.slice(0, 10), v.slice(11, 16));
+    const later = tanks.filter((t) => t.site_id === current && t.active)
+      .map((t) => ({ t, d: dipOf.get(t.id) })).filter((x) => x.d && x.d.taken_at > t0);
+    if (!later.length) { box.innerHTML = ''; return; }
+    const replaceable = later.filter((x) => x.d.source !== 'delivery' && x.d.taken_at - t0 <= 86400000);
+    const times = [...new Set(later.map((x) => fmtWhen(x.d.taken_at)))].join(', ');
+    box.innerHTML = `<div class="note warn">${later.length === 1 ? `${esc(later[0].t.name)} already has` : `${plural(later.length, 'tank')} already have`} a later dip (${esc(times)}).
+      The latest dip is the one that counts${replaceable.length ? '.' : ', so an earlier dip won’t change the level.'}
+      ${replaceable.length ? `<label class="check" style="margin-top:8px;display:flex;gap:8px;align-items:center"><input type="checkbox" id="dip_replace" checked> Replace ${replaceable.length === 1 ? 'that later dip' : 'those later dips'} with these</label>` : ''}</div>`;
+  };
   $('#dip_site').onchange = (e) => {
     current = Number(e.target.value);
     $('#dip_inputs').innerHTML = inputs(current);
+    checkLater();
   };
+  $('#dip_time').oninput = checkLater;
+  $('#dip_time').onchange = checkLater;
 }
 
 async function dipHistoryDialog(tankId) {

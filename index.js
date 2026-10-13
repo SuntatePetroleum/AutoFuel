@@ -1366,10 +1366,16 @@ async function enterDips(request, env, me) {
     const litres = cleanLitres(r.litres, `${tank.site_name} ${tank.name}`);
     const warning = overCapacity(tank, litres);
     if (warning) warnings.push(warning);
+    // Replacing a dip first saved with the wrong time: later office dips within a day go.
+    if (body.replace_later) {
+      stmts.push(env.DB.prepare(
+        "DELETE FROM dips WHERE company_id = ? AND tank_id = ? AND taken_at > ? AND taken_at <= ? AND source IN ('manual', 'upload')"
+      ).bind(me.company_id, tank.id, takenAt, takenAt + 86400000));
+    }
     stmts.push(saveDip(env, me.company_id, me.id, tank.id, litres, takenAt, 'manual'));
   }
   await env.DB.batch(stmts);
-  return json({ ok: true, saved: stmts.length, warnings });
+  return json({ ok: true, saved: readings.length, warnings });
 }
 
 // A sheet of readings. Each row names its site, and its tank by name (or by grade
